@@ -1,0 +1,3651 @@
+,id,URL,Research_Papers
+0,1,https://dl.acm.org/doi/pdf/10.1145/3397271.3401075,"ColBERT: Efficient and Effective Passage Search via
+Contextualized Late Interaction over BERT
+Omar Khattab
+Stanford University
+okhattab@stanford.eduMatei Zaharia
+Stanford University
+matei@cs.stanford.edu
+ABSTRACT
+Recent progress in Natural Language Understanding (NLU) is driv-
+ing fast-paced advances in Information Retrieval (IR), largely owed
+to fine-tuning deep language models (LMs) for document ranking.
+While remarkably effective, the ranking models based on these LMs
+increase computational cost by orders of magnitude over prior ap-
+proaches, particularly as they must feed each query–document pair
+through a massive neural network to compute a single relevance
+score. To tackle this, we present ColBERT, a novel ranking model
+that adapts deep LMs (in particular, BERT) for efficient retrieval.
+ColBERT introduces a late interaction architecture that indepen-
+dently encodes the query and the document using BERT and then
+employs a cheap yet powerful interaction step that models their fine-
+grained similarity. By delaying and yet retaining this fine-granular
+interaction, ColBERT can leverage the expressiveness of deep LMs
+while simultaneously gaining the ability to pre-compute document
+representations offline, considerably speeding up query processing.
+Crucially, ColBERT’s pruning-friendly interaction mechanism en-
+ables leveraging vector-similarity indexes for end-to-end retrieval
+directly from millions of documents. We extensively evaluate Col-
+BERT using two recent passage search datasets. Results show that
+ColBERT’s effectiveness is competitive with existing BERT-based
+models (and outperforms every non-BERT baseline), while exe-
+cuting two orders-of-magnitude faster and requiring up to four
+orders-of-magnitude fewer FLOPs per query.
+KEYWORDS
+Neural IR; Efficiency; Deep Language Models; BERT
+ACM Reference Format:
+Omar Khattab and Matei Zaharia. 2020. ColBERT: Efficient and Effective Pas-
+sage Search via Contextualized Late Interaction over BERT. In Proceedings of
+the 43rd International ACM SIGIR Conference on Research and Development in
+Information Retrieval (SIGIR ’20), July 25–30, 2020, Virtual Event, China. ACM,
+New York, NY, USA, 10 pages. https://doi.org/10.1145/3397271.3401075
+1 INTRODUCTION
+Over the past few years, the Information Retrieval (IR) community
+has witnessed the introduction of a host of neural ranking models,
+including DRMM [ 7], KNRM [ 4,36], and Duet [ 20,22]. In contrast
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+©2020 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-8016-4/20/07. . . $15.00
+https://doi.org/10.1145/3397271.3401075
+0.15 0.20 0.25 0.30 0.35 0.40
+MRR@10101102103104105Query Latency (ms)
+BM25doc2queryKNRMDuet
+DeepCTfT+ConvKNRM
+docTTTTTqueryBERT-baseBERT-large
+ColBERT (re-rank)ColBERT (full retrieval)Bag-of-Words (BoW) Model
+BoW Model with NLU Augmentation
+Neural Matching Model
+Deep Language Model
+ColBERT (ours)Figure 1: Effectiveness (MRR@10) versus Mean Query La-
+tency (log-scale) for a number of representative ranking
+models on MS MARCO Ranking [24]. The figure also shows
+ColBERT. Neural re-rankers run on top of the official BM25
+top-1000 results and use a Tesla V100 GPU. Methodology and
+detailed results are in §4.
+to prior learning-to-rank methods that rely on hand-crafted fea-
+tures, these models employ embedding-based representations of
+queries and documents and directly model local interactions (i.e.,
+fine-granular relationships) between their contents. Among them,
+a recent approach has emerged that fine-tunes deep pre-trained
+language models (LMs) like ELMo [ 29] and BERT [ 5] for estimating
+relevance. By computing deeply-contextualized semantic repre-
+sentations of query–document pairs, these LMs help bridge the
+pervasive vocabulary mismatch [ 21,42] between documents and
+queries [ 30]. Indeed, in the span of just a few months, a number
+of ranking models based on BERT have achieved state-of-the-art
+results on various retrieval benchmarks [ 3,18,25,39] and have
+been proprietarily adapted for deployment by Google1and Bing2.
+However, the remarkable gains delivered by these LMs come
+at a steep increase in computational cost. Hofstätter et al. [9] and
+MacAvaney et al. [18] observe that BERT-based models in the lit-
+erature are 100-1000 ×more computationally expensive than prior
+models—some of which are arguably notinexpensive to begin with
+[13]. This quality–cost tradeoff is summarized by Figure 1, which
+compares two BERT-based rankers [ 25,27] against a representative
+set of ranking models. The figure uses MS MARCO Ranking [ 24],
+a recent collection of 9M passages and 1M queries from Bing’s
+logs. It reports retrieval effectiveness (MRR@10) on the official
+validation set as well as average query latency (log-scale) using a
+high-end server that dedicates one Tesla V100 GPU per query for
+neural re-rankers. Following the re-ranking setup of MS MARCO,
+ColBERT (re-rank), the Neural Matching Models, and the Deep LMs
+re-rank MS MARCO’s official top-1000 documents per query. Other
+1https://blog.google/products/search/search-language-understanding-bert/
+2https://azure.microsoft.com/en-us/blog/bing-delivers-its-largest-improvement-
+in-search-experience-using-azure-gpus/
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+39
+Query Document
+MaxSim∑
+MaxSim MaxSims
+QueryCNN  /  Match KernelsCNN  /  Match Kernels / MLPMLPs
+Document
+(c) All-to-all Interaction
+(e.g., BERT)(b) Query-Document Interaction
+(e.g., DRMM, KNRM, Conv-KNRM)(d) Late Interaction
+(i.e., the proposed ColBERT)(a) Representation-based Similarity
+(e.g., DSSM, SNRM)Query Document
+s
+Query Document
+sFigure 2: Schematic diagrams illustrating query–document matching paradigms in neural IR. The figure contrasts existing
+approaches (sub-figures (a), (b), and (c)) with the proposed late interaction paradigm (sub-figure (d)).
+methods, including ColBERT (full retrieval), directly retrieve the
+top-1000 results from the entire collection.
+As the figure shows, BERT considerably improves search preci-
+sion, raising MRR@10 by almost 7% against the best previous meth-
+ods; simultaneously, it increases latency by up to tens of thousands
+of milliseconds even with a high-end GPU. This poses a challenging
+tradeoff since raising query response times by as little as 100ms is
+known to impact user experience and even measurably diminish
+revenue [ 17]. To tackle this problem, recent work has started explor-
+ing using Natural Language Understanding (NLU) techniques to
+augment traditional retrieval models like BM25 [ 32]. For example,
+Nogueira et al. [26,28] expand documents with NLU-generated
+queries before indexing with BM25 scores and Dai & Callan [ 2] re-
+place BM25’s term frequency with NLU-estimated term importance.
+Despite successfully reducing latency, these approaches generally
+reduce precision substantially relative to BERT.
+To reconcile efficiency and contextualization in IR, we propose
+ColBERT , a ranking model based on contextualized late interac-
+tion over BERT . As the name suggests, ColBERT proposes a novel
+late interaction paradigm for estimating relevance between a query
+𝑞and a document 𝑑. Under late interaction, 𝑞and𝑑are separately
+encoded into two sets of contextual embeddings, and relevance is
+evaluated using cheap and pruning-friendly computations between
+both sets—that is, fast computations that enable ranking without
+exhaustively evaluating every possible candidate.
+Figure 2 contrasts our proposed late interaction approach with
+existing neural matching paradigms. On the left, Figure 2 (a) illus-
+trates representation-focused rankers, which independently compute
+an embedding for 𝑞and another for 𝑑and estimate relevance as
+a single similarity score between two vectors [ 12,41]. Moving to
+the right, Figure 2 (b) visualizes typical interaction-focused rankers.
+Instead of summarizing 𝑞and𝑑into individual embeddings, these
+rankers model word- and phrase-level relationships across 𝑞and𝑑
+and match them using a deep neural network (e.g., with CNNs/MLPs
+[22] or kernels [ 36]). In the simplest case, they feed the neural net-
+work an interaction matrix that reflects the similiarity between
+every pair of words across 𝑞and𝑑. Further right, Figure 2 (c) illus-
+trates a more powerful interaction-based paradigm, which models
+the interactions between words within as well as across𝑞and𝑑at
+the same time, as in BERT’s transformer architecture [25].These increasingly expressive architectures are in tension. While
+interaction-based models (i.e., Figure 2 (b) and (c)) tend to be su-
+perior for IR tasks [ 8,21], a representation-focused model—by iso-
+lating the computations among 𝑞and𝑑—makes it possible to pre-
+compute document representations offline [ 41], greatly reducing
+the computational load per query. In this work, we observe that
+the fine-grained matching in interaction-based models and the pre-
+computation in representation-based models can be combined by
+retaining yet judiciously delaying the query–document interaction.
+Figure 2 (d) illustrates an architecture that precisely does so. As
+illustrated, every query embedding interacts with all document
+embeddings via a MaxSim operator, which computes maximum
+similarity (e.g., cosine), and the scalar outputs of these operators
+are summed across query terms. This paradigm allows ColBERT to
+exploit deep LM-based representations while shifting the cost of
+encoding documents offline and amortizing the cost of encoding
+the query once across all ranked documents. Crucially, it enables
+ColBERT to leverage vector-similarity search indexes (e.g., [ 1,15])
+to retrieve the top- 𝑘results directly from a large document collec-
+tion. This ability substantially improves recall over existing models,
+which only re-rank the output of term-based retrieval.
+As Figure 1 illustrates, ColBERT can serve queries in tens or, for
+end-to-end retrieval from millions of documents, few hundreds of
+milliseconds. For instance, when used for re-ranking as in “ColBERT
+(re-rank)”, it delivers over 170 ×speedup (and requires 14,000 ×fewer
+FLOPs) relative to existing BERT-based models [ 25,27], while be-
+ing more effective than every non-BERT baseline (§4.2 & 4.3). Col-
+BERT’s indexing—the only time it needs to feed documents through
+BERT—is also practical: it can index the MS MARCO collection of
+9M passages in about 3 hours using a single server with four GPUs
+(§4.5), retaining its effectiveness with a space footprint of as little
+as few tens of GiBs. Our ablation study (§4.4) shows that late in-
+teraction, its implementation via MaxSim operations, and crucial
+design choices within our BERT-based encoders are all essential to
+ColBERT’s effectiveness.
+Our main contributions are as follows.
+(1)We propose late interaction (§3.1) as a paradigm for efficient
+and effective neural ranking.
+(2)We present ColBERT (§3.2 & 3.3), a highly-effective model
+that employs novel BERT-based query and document en-
+coders within the late interaction paradigm.
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+40(3)We show how to leverage ColBERT both for re-ranking on
+top of a term-based retrieval model (§3.5) and for searching
+a full collection using vector similarity indexes (§3.6).
+(4)We evaluate ColBERT on MS MARCO and TREC CAR, two
+recent passage search collections.
+We release our reference implementation as open source.3
+2 RELATED WORK
+Neural Matching Models. Over the past few years, IR researchers
+have introduced numerous neural architectures for ranking. In
+this work, we compare against KNRM [ 4,36], Duet [ 20,22], Con-
+vKNRM [ 4], and fastText+ConvKNRM [ 10]. KNRM proposes a dif-
+ferentiable kernel-pooling technique for extracting matching sig-
+nals from an interaction matrix, while Duet combines signals from
+exact-match-based as well as embedding-based similarities for rank-
+ing. Introduced in 2018, ConvKNRM learns to match 𝑛-grams in the
+query and the document. Lastly, fastText+ConvKNRM (abbreviated
+fT+ConvKNRM) tackles the absence of rare words from typical
+word embeddings lists by adopting sub-word token embeddings.
+In 2018, Zamani et al. [41] introduced SNRM, a representation-
+focused IR model that encodes each query and each document as
+a single, sparse high-dimensional vector of “latent terms”. By pro-
+ducing a sparse-vector representation for each document, SNRM
+is able to use a traditional IR inverted index for representing docu-
+ments, allowing fast end-to-end retrieval. Despite highly promising
+results and insights, SNRM’s effectiveness is substantially outper-
+formed by the state of the art on the datasets with which it was
+evaluated (e.g., see [ 18,38]). While SNRM employs sparsity to al-
+low using inverted indexes, we relax this assumption and compare
+a (dense) BERT-based representation-focused model against our
+late-interaction ColBERT in our ablation experiments in §4.4. For a
+detailed overview of existing neural ranking models, we refer the
+readers to two recent surveys of the literature [8, 21].
+Language Model Pretraining for IR. Recent work in NLU
+emphasizes the importance pre-training language representation
+models in an unsupervised fashion before subsequently fine-tuning
+them on downstream tasks. A notable example is BERT [ 5], a bi-
+directional transformer-based language model whose fine-tuning
+advanced the state of the art on various NLU benchmarks. Nogueira et
+al.[25], MacAvaney et al. [18], and Dai & Callan [ 3] investigate
+incorporating such LMs (mainly BERT, but also ELMo [ 29]) on dif-
+ferent ranking datasets. As illustrated in Figure 2 (c), the common
+approach (and the one adopted by Nogueira et al. on MS MARCO
+and TREC CAR) is to feed the query–document pair through BERT
+and use an MLP on top of BERT’s [CLS] output token to produce a
+relevance score. Subsequent work by Nogueira et al. [27] introduced
+duoBERT, which fine-tunes BERT to compare the relevance of a
+pair of documents given a query. Relative to their single-document
+BERT, this gives duoBERT about 1% MRR@10 advantage on MS
+MARCO while increasing the cost by at least 1.4×.
+BERT Optimizations. As discussed in §1, these rankers can be
+highly expensive in practice. Orthogonal to our approach, there are
+ongoing efforts in the NLU literature for distilling [ 14,33], compress-
+ing [ 40], and pruning [ 19] BERT. Other optimizations may trade
+quality and speed specifically for IR (e.g., re-ranking with a smaller
+3https://github.com/stanford-futuredata/ColBERT
+Query Document
+Query Encoder, fQ Document Encoder, fDMaxSim MaxSim MaxSimscore
+Offline IndexingFigure 3: The general architecture of ColBERT given a query
+𝑞and a document 𝑑.
+depth𝑘(§4.2) or truncating longer documents). While these efforts
+can be instrumental in narrowing the efficiency gap, they generally
+achieve much smaller speedups than our re-designed architecture
+for IR, due to their generic nature, and the more aggressive ones
+often come at the cost of noticeably lower quality.
+Efficient NLU-based Models. Recently, a direction emerged
+that employs expensive NLU computation offline. This includes
+doc2query [ 28] and DeepCT [ 2]. The doc2query model expands
+each document with a pre-defined number of synthetic queries, gen-
+erated by a seq2seq transformer model trained to generate queries
+given a document. It then relies on a BM25 index for retrieval from
+the (expanded) documents. DeepCT uses BERT to produce the term
+frequency component of BM25 in a context-aware manner, essen-
+tially representing a feasible realization of the term-independence
+assumption with neural networks [ 23]. Lastly, docTTTTTquery [ 26]
+is identical to doc2query except that it fine-tunes a pre-trained
+model (namely, T5 [31]) for generating the predicted queries.
+Concurrently with the drafting of this paper, Hofstätter et al. [11]
+published their Transformer-Kernel (TK) model. At a high level, TK
+improves the KNRM architecture described earlier: while KNRM
+employs kernel pooling on top of word-embedding-based inter-
+action, TK uses a Transformer [ 34] component for contextually
+encoding queries and documents before kernel pooling. TK estab-
+lishes a new state-of-the-art for non-BERT models on MS MARCO
+(Dev); however, the best non-ensemble MRR@10 it achieves is 31%
+while ColBERT reaches up to 36%. Moreover, due to indexing docu-
+ment representations offline and employing a MaxSim-based late
+interaction mechanism, ColBERT is much more scalable, enabling
+end-to-end retrieval which is not supported by TK.
+3 COLBERT
+ColBERT prescribes a simple framework for balancing the quality
+and cost of neural IR, particularly deep language models like BERT.
+As introduced earlier, delaying the query–document interaction can
+facilitate cheap neural re-ranking (i.e., through pre-computation)
+and even support practical end-to-end neural retrieval (i.e., through
+pruning via vector-similarity search). ColBERT addresses how to
+do so while still preserving the effectiveness of state-of-the-art
+models, which condition the bulk of their computations on the joint
+query–document pair.
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+41Even though ColBERT’s late-interaction framework can be ap-
+plied to a wide variety of architectures (e.g., CNNs, RNNs, transform-
+ers, etc.), we choose to focus this work on bi-directional transformer-
+based encoders (i.e., BERT) owing to their state-of-the-art effective-
+ness yet very high computational cost.
+3.1 Architecture
+Figure 3 depicts the general architecture of ColBERT, which com-
+prises: (a) a query encoder 𝑓𝑄, (b) a document encoder 𝑓𝐷, and (c)
+the late interaction mechanism. Given a query 𝑞and document 𝑑,
+𝑓𝑄encodes𝑞into a bag of fixed-size embeddings 𝐸𝑞while𝑓𝐷en-
+codes𝑑into another bag 𝐸𝑑. Crucially, each embeddings in 𝐸𝑞and
+𝐸𝑑iscontextualized based on the other terms in 𝑞or𝑑, respectively.
+We describe our BERT-based encoders in §3.2.
+Using𝐸𝑞and𝐸𝑑, ColBERT computes the relevance score be-
+tween𝑞and𝑑via late interaction, which we define as a summation
+of maximum similarity (MaxSim) operators. In particular, we find
+the maximum cosine similarity of each 𝑣∈𝐸𝑞with vectors in 𝐸𝑑,
+and combine the outputs via summation. Besides cosine, we also
+evaluate squared L2 distance as a measure of vector similarity. In-
+tuitively, this interaction mechanism softly searches for each query
+term𝑡𝑞—in a manner that reflects its context in the query—against
+the document’s embeddings, quantifying the strength of the “match”
+via the largest similarity score between 𝑡𝑞and a document term 𝑡𝑑.
+Given these term scores, it then estimates the document relevance
+by summing the matching evidence across all query terms.
+While more sophisticated matching is possible with other choices
+such as deep convolution and attention layers (i.e., as in typical
+interaction-focused models), a summation of maximum similarity
+computations has two distinctive characteristics. First, it stands
+out as a particularly cheap interaction mechanism, as we examine
+its FLOPs in §4.2. Second, and more importantly, it is amenable
+to highly-efficient pruning for top- 𝑘retrieval, as we evaluate in
+§4.3. This enables using vector-similarity algorithms for skipping
+documents without materializing the full interaction matrix or even
+considering each document in isolation. Other cheap choices (e.g.,
+a summation of average similarity scores, instead of maximum) are
+possible; however, many are less amenable to pruning. In §4.4, we
+conduct an extensive ablation study that empirically verifies the ad-
+vantage of our MaxSim-based late interaction against alternatives.
+3.2 Query & Document Encoders
+Prior to late interaction, ColBERT encodes each query or document
+into a bag of embeddings, employing BERT-based encoders. We
+share a single BERT model among our query and document en-
+coders but distinguish input sequences that correspond to queries
+and documents by prepending a special token [Q]to queries and
+another token [D]to documents.
+Query Encoder. Given a textual query 𝑞, we tokenize it into its
+BERT-based WordPiece [ 35] tokens𝑞1𝑞2...𝑞𝑙. We prepend the token
+[Q]to the query. We place this token right after BERT’s sequence-
+start token [CLS] . If the query has fewer than a pre-defined number
+of tokens𝑁𝑞, we pad it with BERT’s special [mask] tokens up
+to length𝑁𝑞(otherwise, we truncate it to the first 𝑁𝑞tokens).
+This padded sequence of input tokens is then passed into BERT’sdeep transformer architecture, which computes a contextualized
+representation of each token.
+We denote the padding with masked tokens as query augmen-
+tation , a step that allows BERT to produce query-based embeddings
+at the positions corresponding to these masks. Query augmentation
+is intended to serve as a soft, differentiable mechanism for learning
+to expand queries with new terms or to re-weigh existing terms
+based on their importance for matching the query. As we show in
+§4.4, this operation is essential for ColBERT’s effectiveness.
+Given BERT’s representation of each token, our encoder passes
+the contextualized output representations through a linear layer
+with no activations. This layer serves to control the dimension of
+ColBERT’s embeddings, producing 𝑚-dimensional embeddings for
+the layer’s output size 𝑚. As we discuss later, we typically fix 𝑚to
+be much smaller than BERT’s fixed hidden dimension.
+While ColBERT’s embedding dimension has limited impact on
+the efficiency of query encoding, this step is crucial for controlling
+the space footprint of documents, as we show in §4.5. In addition,
+it can have a significant impact on query execution time, particu-
+larly the time taken for transferring the document representations
+onto the GPU from system memory (where they reside before pro-
+cessing a query). In fact, as we show in §4.2, gathering, stacking,
+and transferring the embeddings from CPU to GPU can be the
+most expensive step in re-ranking with ColBERT. Finally, the out-
+put embeddings are normalized so each has L2 norm equal to one.
+The result is that the dot-product of any two embeddings becomes
+equivalent to their cosine similarity, falling in the [−1,1]range.
+Document Encoder. Our document encoder has a very similar
+architecture. We first segment a document 𝑑into its constituent
+tokens𝑑1𝑑2...𝑑𝑚, to which we prepend BERT’s start token [CLS] fol-
+lowed by our special token [D]that indicates a document sequence.
+Unlike queries, we do not append [mask] tokens to documents. Af-
+ter passing this input sequence through BERT and the subsequent
+linear layer, the document encoder filters out the embeddings corre-
+sponding to punctuation symbols, determined via a pre-defined list.
+This filtering is meant to reduce the number of embeddings per doc-
+ument, as we hypothesize that (even contextualized) embeddings
+of punctuation are unnecessary for effectiveness.
+In summary, given 𝑞=𝑞0𝑞1...𝑞𝑙and𝑑=𝑑0𝑑1...𝑑𝑛, we compute
+the bags of embeddings 𝐸𝑞and𝐸𝑑in the following manner, where
+#refers to the [mask] tokens:
+𝐸𝑞:=Normalize(CNN(BERT(“[𝑄]𝑞0𝑞1...𝑞𝑙##...#”))) (1)
+𝐸𝑑:=Filter(Normalize(CNN(BERT(“[𝐷]𝑑0𝑑1...𝑑𝑛”)))) (2)
+3.3 Late Interaction
+Given the representation of a query 𝑞and a document 𝑑, the rele-
+vance score of 𝑑to𝑞, denoted as𝑆𝑞,𝑑, is estimated via late interaction
+between their bags of contextualized embeddings. As mentioned
+before, this is conducted as a sum of maximum similarity computa-
+tions, namely cosine similarity (implemented as dot-products due
+to the embedding normalization) or squared L2 distance.
+𝑆𝑞,𝑑:=Õ
+𝑖∈[|𝐸𝑞|]max
+𝑗∈[|𝐸𝑑|]𝐸𝑞𝑖·𝐸𝑇
+𝑑𝑗(3)
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+42ColBERT is differentiable end-to-end. We fine-tune the BERT
+encoders and train from scratch the additional parameters (i.e., the
+linear layer and the [Q] and [D] markers’ embeddings) using the
+Adam [ 16] optimizer. Notice that our interaction mechanism has
+no trainable parameters. Given a triple ⟨𝑞,𝑑+,𝑑−⟩with query 𝑞,
+positive document 𝑑+and negative document 𝑑−, ColBERT is used
+to produce a score for each document individually and is optimized
+via pairwise softmax cross-entropy loss over the computed scores
+of𝑑+and𝑑−.
+3.4 Offline Indexing: Computing & Storing
+Document Embeddings
+By design, ColBERT isolates almost all of the computations be-
+tween queries and documents to enable pre-computing document
+representations offline. At a high level, our indexing procedure is
+straight-forward: we proceed over the documents in the collection
+in batches, running our document encoder 𝑓𝐷on each batch and
+storing the output embeddings per document. Although indexing a
+set of documents is an offline process, we incorporate a few simple
+optimizations for enhancing its throughput. As we show in §4.5,
+these can considerably reduce the offline cost of indexing.
+To begin with, we exploit multiple GPUs, if available, for faster
+encoding of batches of documents in parallel. When batching, we
+pad all documents to the maximum length of a document within
+the batch.4To make capping the sequence length on a per-batch
+basis effective, our indexer proceeds through documents in large
+groups of𝐵(e.g.,𝐵=100,000) documents. It sorts these documents
+by length and then feeds batches of 𝑏(e.g.,𝑏=128) documents of
+comparable length through our encoder. Such length-based bucket-
+ing is sometimes refered to as a BucketIterator in some libraries
+(e.g., allenNLP). Lastly, while most computations occur on the GPU,
+we found that a non-trivial portion of the indexing time is spent on
+pre-processing the text sequences, primarily BERT’s WordPiece to-
+kenization. Exploiting that these operations are independent across
+documents in a batch, we parallelize the pre-processing across the
+available CPU cores.
+Once the document representations are produced, they are saved
+to disk using 32-bit or 16-bit values to represent each dimension.
+As we describe in §3.5 and 3.6, these representations are either
+simply loaded from disk for ranking or are subsequently indexed
+for vector-similarity search, respectively.
+3.5 Top-𝑘Re-ranking with ColBERT
+Recall that ColBERT can be used for re-ranking the output of an-
+other retrieval model, typically a term-based model, or directly
+for end-to-end retrieval from a document collection. In this sec-
+tion, we discuss how we use ColBERT for ranking a small set of
+𝑘(e.g.,𝑘=1000) documents given a query 𝑞. Since𝑘is small, we
+rely on batch computations to exhaustively score each document
+(unlike our approach in §3.6). To begin with, our query serving sub-
+system loads the indexed documents representations into memory,
+representing each document as a matrix of embeddings.
+Given a query 𝑞, we compute its bag of contextualized embed-
+dings𝐸𝑞(Equation 1) and, concurrently, gather the document repre-
+sentations into a 3-dimensional tensor 𝐷consisting of 𝑘document
+4The public BERT implementations we saw simply pad to a pre-defined length.matrices. We pad the 𝑘documents to their maximum length to
+facilitate batched operations, and move the tensor 𝐷to the GPU’s
+memory. On the GPU, we compute a batch dot-product of 𝐸𝑞and
+𝐷, possibly over multiple mini-batches. The output materializes a
+3-dimensional tensor that is a collection of cross-match matrices
+between𝑞and each document. To compute the score of each docu-
+ment, we reduce its matrix across document terms via a max-pool
+(i.e., representing an exhaustive implementation of our MaxSim
+computation) and reduce across query terms via a summation. Fi-
+nally, we sort the 𝑘documents by their total scores.
+Relative to existing neural rankers (especially, but not exclusively,
+BERT-based ones), this computation is very cheap that, in fact, the
+cost of a simple implementation is dominated by the gathering
+and transferring of the pre-computed embeddings. To illustrate,
+ranking𝑘documents via typical BERT rankers requires feeding
+BERT𝑘different inputs each of length 𝑙=|𝑞|+|𝑑𝑖|for query𝑞and
+documents𝑑𝑖, where attention has quadratic cost in the length of
+the sequence. In contrast, ColBERT feeds BERT only a single, much
+shorter sequence of length 𝑙=|𝑞|. Consequently, ColBERT is not
+only cheaper, it also scales much better with 𝑘(§4.2).
+3.6 End-to-end Top- 𝑘Retrieval with ColBERT
+As mentioned before, ColBERT’s late-interaction operator is specifi-
+cally designed to enable end-to-end retrieval from a large collection,
+largely to improve recall relative to term-based retrieval approaches.
+This section is concerned with cases where the number of docu-
+ments to be ranked is too large for exhaustive evaluation of each
+possible candidate document, particularly when we are only in-
+terested in the highest scoring ones. Concretely, we focus here on
+retrieving the top- 𝑘results directly from a large document collec-
+tion with𝑁(e.g.,𝑁=10,000,000) documents, where 𝑘≪𝑁.
+To do so, we leverage the pruning-friendly nature of the MaxSim
+operations at the backbone of late interaction. Instead of applying
+MaxSim between one of the query embeddings and all of one docu-
+ment’s embeddings, we can use fast vector-similarity data structures
+to efficiently conduct this search between the query embedding
+andalldocument embeddings across the full collection. For this,
+we employ an off-the-shelf library for large-scale vector-similarity
+search, namely faiss [15] from Facebook.5In particular, at the
+end of offline indexing (§3.4), we maintain a mapping from each
+embedding to its document of origin and then index all document
+embeddings into faiss.
+Subsequently, when serving queries, we use a two-stage pro-
+cedure to retrieve the top- 𝑘documents from the entire collection.
+Both stages rely on ColBERT’s scoring: the first is an approximate
+stage aimed at filtering while the second is a refinement stage. For
+the first stage, we concurrently issue 𝑁𝑞vector-similarity queries
+(corresponding to each of the embeddings in 𝐸𝑞) onto our faiss in-
+dex. This retrieves the top- 𝑘′(e.g.,𝑘′=𝑘/2) matches for that vector
+over all document embeddings. We map each of those to its docu-
+ment of origin, producing 𝑁𝑞×𝑘′document IDs, only 𝐾≤𝑁𝑞×𝑘′
+of which are unique. These 𝐾documents likely contain one or more
+embeddings that are highly similar to the query embeddings. For
+the second stage, we refine this set by exhaustively re-ranking only
+those𝐾documents in the usual manner described in §3.5.
+5https://github.com/facebookresearch/faiss
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+43In our faiss -based implementation, we use an IVFPQ index
+(“inverted file with product quantization”). This index partitions
+the embedding space into 𝑃(e.g.,𝑃=1000) cells based on 𝑘-means
+clustering and then assigns each document embedding to its nearest
+cell based on the selected vector-similarity metric. For serving
+queries, when searching for the top- 𝑘′matches for a single query
+embedding, only the nearest 𝑝(e.g.,𝑝=10) partitions are searched.
+To improve memory efficiency, every embedding is divided into 𝑠
+(e.g.,𝑠=16) sub-vectors, each represented using one byte. Moreover,
+the index conducts the similarity computations in this compressed
+domain, leading to cheaper computations and thus faster search.
+4 EXPERIMENTAL EVALUATION
+We now turn our attention to empirically testing ColBERT, address-
+ing the following research questions.
+RQ1: In a typical re-ranking setup, how well can ColBERT bridge
+the existing gap (highlighted in §1) between highly-efficient and
+highly-effective neural models? (§4.2)
+RQ2: Beyond re-ranking, can ColBERT effectively support end-
+to-end retrieval directly from a large collection? (§4.3)
+RQ3: What does each component of ColBERT (e.g., late interac-
+tion, query augmentation) contribute to its quality? (§4.4)
+RQ4: What are ColBERT’s indexing-related costs in terms of
+offline computation and memory overhead? (§4.5)
+4.1 Methodology
+4.1.1 Datasets & Metrics. Similar to related work [ 2,27,28], we
+conduct our experiments on the MS MARCO Ranking [ 24] (hence-
+forth, MS MARCO) and TREC Complex Answer Retrieval (TREC-
+CAR) [ 6] datasets. Both of these recent datasets provide large train-
+ing data of the scale that facilitates training and evaluating deep
+neural networks. We describe both in detail below.
+MS MARCO. MS MARCO is a dataset (and a corresponding
+competition) introduced by Microsoft in 2016 for reading compre-
+hension and adapted in 2018 for retrieval. It is a collection of 8.8M
+passages from Web pages, which were gathered from Bing’s re-
+sults to 1M real-world queries. Each query is associated with sparse
+relevance judgements of one (or very few) documents marked as
+relevant and no documents explicitly indicated as irrelevant. Per
+the official evaluation, we use MRR@10 to measure effectiveness.
+We use three query sets in our evaluation. The official develop-
+ment and evaluation sets contain roughly 7k queries. The relevance
+judgements of the evaluation set are held-out by Microsoft and
+MRR@10 results can only be obtained by submitting to the com-
+petition’s organizers. We submitted our main re-ranking ColBERT
+model for §4.2. In addition, the collection includes roughly 55k
+queries (with labels) that are provided as additional validation data.
+We re-purpose a random sample of 5k queries among those (i.e.,
+ones not in our development or training sets) as a “local” evaluation
+set. Along with the official development set, we use this held-out
+set for testing our models as well as baselines in §4.3. We do so to
+avoid submitting multiple variants of the same model at once, as
+the organizers discourage too many submissions by the same team.
+TREC CAR. Introduced by Dietz [ 6]et al. in 2017, TREC CAR is
+a synthetic dataset based on Wikipedia that consists of about 29M
+passages. Similar to related work [ 25], we dedicate the first fourof five pre-defined folds for training (and the fifth for validation),
+which amounts to roughly 3M queries generated by concatenating
+the title of a Wikipedia page with the heading of one of its sections.
+That section’s passages are marked as relevant to the corresponding
+query. Our evaluation is conducted on the test set used in TREC
+2017 CAR, which contains 2,254 queries.
+4.1.2 Implementation. Our ColBERT models are implemented us-
+ing Python 3 and PyTorch 1. We use the popular transformers6
+library for pre-trained BERT. Similar to [ 25], we fine-tune all Col-
+BERT models with learning rate 3×10−6with a batch size 32. We fix
+the number of embeddings per query at 𝑁𝑞=32. Unless otherwise
+stated, we set our ColBERT embedding dimension 𝑚to 128; §4.5
+demonstrates ColBERT’s robustness to a wide range of dimensions.
+For MS MARCO, we initialize the BERT components of the Col-
+BERT query and document encoders using Google’s official pre-
+trained BERT basemodel and train all models for 200k iterations.
+For TREC CAR, we follow related work [ 2,25] and use a different
+pre-trained model to the official ones. To explain, the official BERT
+models were pre-trained on Wikipedia, which is the source of TREC
+CAR’s training and test sets. To avoid leaking test data into train,
+Nogueira and Cho [ 25] pre-train a BERT model on the Wiki pages
+corresponding to training subset of TREC CAR. They release their
+BERT large pre-trained model, which we fine-tune for ColBERT’s ex-
+periments on TREC CAR. As BERT large embeddings are larger, we
+set𝑚to 200, and since fine-tuning this model is significantly slower
+than BERT base, we train on TREC CAR for only 125k iterations.
+In our re-ranking results, unless otherwise stated, we use 4 bytes
+per dimension in our embeddings and employ cosine as our vector-
+similarity function. For end-to-end ranking, we use (squared) L2
+distance, as we found our faiss index was faster at L2-based re-
+trieval. For our faiss index, we set the number of partitions to
+𝑃=2,000, and search the nearest 𝑝=10to each query embedding to
+retrieve𝑘′=𝑘=1000 document vectors per query embedding. We
+divide each embedding into 𝑠=16sub-vectors, each encoded using
+one byte. To represent the index used for the second stage of our
+end-to-end retrieval procedure, we use 16-bit values per dimension.
+4.1.3 Hardware & Time Measurements. To evaluate the latency of
+neural re-ranking models in §4.2, we use a single Tesla V100 GPU
+that has 32 GiBs of memory on a server with two Intel Xeon Gold
+6132 CPUs, each with 14 physical cores (24 hyperthreads), and 469
+GiBs of RAM. For the mostly CPU-based retrieval experiments in
+§4.3 and the indexing experiments in §4.5, we use another server
+with the same CPU and system memory specifications but which
+has four Titan V GPUs attached, each with 12 GiBs of memory.
+Across all experiments, only one GPU is dedicated per query for
+retrieval (i.e., for methods with neural computations) but we use
+up to all four GPUs during indexing.
+4.2 Quality–Cost Tradeoff: Top- 𝑘Re-ranking
+In this section, we examine ColBERT’s efficiency and effectiveness
+at re-ranking the top- 𝑘results extracted by a bag-of-words retrieval
+model, which is the most typical setting for testing and deploying
+neural ranking models. We begin with the MS MARCO dataset. We
+6https://github.com/huggingface/transformers
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+44Method MRR@10 (Dev) MRR@10 (Eval) Re-ranking Latency (ms) FLOPs/query
+BM25 (official) 16.7 16.5 - -
+KNRM 19.8 19.8 3 592M (0.085×)
+Duet 24.3 24.5 22 159B (23×)
+fastText+ConvKNRM 29.0 27.7 28 78B (11×)
+BERT base[25] 34.7 - 10,700 97T (13,900×)
+BERT base(our training) 36.0 - 10,700 97T (13,900×)
+BERT large [25] 36.5 35.9 32,900 340T (48,600×)
+ColBERT (over BERT base) 34.9 34.9 61 7B (1×)
+Table 1: “Re-ranking” results on MS MARCO. Each neural model re-ranks the official top-1000 results produced by BM25.
+Latency is reported for re-ranking only. To obtain the end-to-end latency in Figure 1, we add the BM25 latency from Table 2.
+Method MRR@10 (Dev) MRR@10 (Local Eval) Latency (ms) Recall@50 Recall@200 Recall@1000
+BM25 (official) 16.7 - - - - 81.4
+BM25 (Anserini) 18.7 19.5 62 59.2 73.8 85.7
+doc2query 21.5 22.8 85 64.4 77.9 89.1
+DeepCT 24.3 - 62(est.) 69 [2] 82 [2] 91 [2]
+docTTTTTquery 27.7 28.4 87 75.6 86.9 94.7
+ColBERT L2(re-rank) 34.8 36.4 - 75.3 80.5 81.4
+ColBERT L2(end-to-end) 36.0 36.7 458 82.9 92.3 96.8
+Table 2: End-to-end retrieval results on MS MARCO. Each model retrieves the top-1000 documents per query directly from the
+entire 8.8M document collection.
+compare against KNRM, Duet, and fastText+ConvKNRM, a repre-
+sentative set of neural matching models that have been previously
+tested on MS MARCO. In addition, we compare against the adapta-
+tion of BERT for ranking by Nogueira and Cho [ 25], in particular,
+their BERT baseand its deeper counterpart BERT large.7
+We report the competition’s official metric, namely MRR@10, on
+the validation set (Dev) and the evaluation set (Eval). We also report
+the re-ranking latency, which we measure using a single Tesla V100
+GPU, and the FLOPs per query for each neural ranking model. To do
+so, we adapt the baselines’ publicly-available reference implemen-
+tations into our pytorch testbed. For ColBERT, our reported latency
+subsumes the entire computation from gathering the document
+representations, moving them to the GPU, tokenizing then encod-
+ing the query, and applying late interaction to compute document
+scores. For the baselines, we measure the scoring computations on
+the GPU and exclude the CPU-based text preprocessing (similar
+to [9]). In principle, the baselines can pre-compute most of this
+preprocessing (e.g., document tokenization) offline. We estimate
+the FLOPs using the torchprofile8library.
+We now proceed to study the results, which are reported in Ta-
+ble 1. To begin with, we notice the fast progress from KNRM in
+2017 to the BERT-based models in 2019, manifesting itself in over
+16% increase in MRR@10. As described in §1, the simultaneous
+increase in computational cost is difficult to miss. Judging by their
+rather monotonic pattern of increasingly larger cost and higher ef-
+fectiveness, these results appear to paint a picture where expensive
+models are necessary for high-quality ranking.
+In contrast with this trend, ColBERT (which employs late in-
+teraction over BERT base) performs competitively with the original
+7https://github.com/nyu-dl/dl4marco-bert/
+8https://github.com/mit-han-lab/torchprofileadaptation of BERT baseand BERT large for ranking by Nogueira
+and Cho [ 25,27]. Interestingly, ColBERT appears no worse than
+BERT basein MRR@10—although the latter uses a different loss func-
+tion to ColBERT’s (§3.3). To confirm the intuition that ColBERT’s
+late interaction does trade away some of BERT’s quality, the table
+also reports results of “BERT base(our training)”, which is based on
+Nogueira and Cho’s model of the same size but is optimized with
+pairwise softmax cross-entropy loss. We train it with learning rate
+3×10−6and batch size 16 for 200k iterations. Unlike the original
+BERT baseranker, results show that this model does in fact have an
+edge over ColBERT’s effectiveness.
+While highly competitive in retrieval quality, ColBERT is orders
+of magnitude cheaper than BERT base, in particular, by over 170 ×in
+latency and 13,900×in FLOPs. This highlights the expressiveness
+of our proposed late interaction mechanism when coupled with a
+powerful pre-trained LM like BERT. While ColBERT’s re-ranking
+latency is slightly higher than the non-BERT models shown (i.e., by
+10s of milliseconds), this difference is explained by the time it takes
+a simple Python implementation to gather, stack, and transfer the
+document embeddings to the GPU. In particular, the query encoding
+and interaction in ColBERT consume only 13 milliseconds of its
+total execution time.
+Diving deeper into the quality–cost tradeoff between BERT and
+ColBERT, Figure 4 demonstrates the relationships between FLOPs
+and effectiveness (MRR@10) as a function of the re-ranking depth
+𝑘when re-ranking the top- 𝑘results by BM25, comparing ColBERT
+and BERT base(our training). We conduct this experiment on MS
+MARCO (Dev). We note here that as the official top-1000 ranking
+does not provide the BM25 order (and also lacks documents beyond
+the top-1000 per query), the models in this experiment re-rank the
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+450.27 0.29 0.31 0.33 0.35 0.37
+MRR@10103104105106107108109Million FLOPs (log-scale)
+k=10205010020050010002000
+k=10 20 50 100
+200500
+10002000
+BERTbase (our training)
+ColBERTFigure 4: FLOPs (in millions) and MRR@10 as functions
+of the re-ranking depth 𝑘. Since the official BM25 ranking
+is not ordered, the initial top- 𝑘retrieval is conducted with
+Anserini’s BM25.
+Anserini [ 37] toolkit’s BM25 output. Consequently, both MRR@10
+values at𝑘=1000 are slightly higher from those reported in Table 1.
+Studying the results in Figure 4, we notice that not only is Col-
+BERT much cheaper than BERT for the same model size (i.e., 12-
+layer “base” transformer encoder), it also scales better with the
+number of ranked documents. In part, this is because ColBERT
+only needs to process the query once, irrespective of the number of
+documents evaluated. For instance, at 𝑘=10, BERT requires nearly
+180×more FLOPs than ColBERT; at 𝑘=1000, BERT’s overhead
+jumps to 13,900×. It then reaches 23,000× at𝑘=2000.
+We observe that this orders-of-magnitude reduction in FLOPs
+makes it practical to run ColBERT entirely on the CPU. In fact, sub-
+sequent informal experimentation suggests that ColBERT’s latency
+and FLOPs can be considerably reduced further by a number of
+optimizations, some entailing a controllable quality tradeoff. These
+include using smaller vector dimensions (whose MRR@10 is tested
+in §4.5), padding queries to shorter 𝑁𝑞, processing documents in
+a lengths-aware fashion, and distilling/quantizing the encoder(s)
+(§2), the final two of which are also applicable to the baseline BERT
+reference implementation by Nogueira and Cho [ 25]. Addition-
+ally, caching the document embeddings on the GPU(s)—if sufficient
+GPU memory exists—can significantly reduce ColBERT’s latency.
+Lastly, batch-processing of multiple queries can enhance ColBERT’s
+throughput by improving the GPU utilization of query encoding.
+We leave exploring these opportunities for future work.
+Method MAP MRR@10
+BM25 (Anserini) 15.3 -
+doc2query 18.1 -
+DeepCT 24.6 33.2
+BM25 + BERT base 31.0 -
+BM25 + BERT large 33.5 -
+BM25 + ColBERT 31.3 44.2
+Table 3: Results on TREC CAR.
+Having studied our results on MS MARCO, we now consider
+TREC CAR, whose official metric is MAP. Similar to Table 1, we
+also report MRR@10. The results are summarized in Table 3, which
+includes a number of important baselines (BM25, doc2query, and
+DeepCT) in addition to re-ranking baselines that have previouslybeen tested on this dataset. As the table shows, the results mirror
+those seen with MS MARCO.
+4.3 End-to-end Top- 𝑘Retrieval
+Beyond cheap re-ranking, ColBERT is amenable to top- 𝑘retrieval di-
+rectly from a full collection. Table 2 considers full retrieval, wherein
+each model retrieves the top-1000 documents directly from MS
+MARCO’s 8.8M documents per query. In addition to MRR@10 and
+latency in milliseconds, the table reports Recall@50, Recall@200,
+and Recall@1000, important metrics for a full-retrieval model that
+essentially filters down a large collection on a per-query basis.
+We compare against BM25, in particular MS MARCO’s official
+BM25 ranking as well as a well-tuned baseline based on the Anserini
+toolkit.9While many other traditional models exist, we are not
+aware of any that substantially outperform Anserini’s BM25 im-
+plementation (e.g., see RM3 in [ 28], LMDir in [ 2], or Microsoft’s
+proprietary feature-based RankSVM on the leaderboard).
+We also compare against doc2query, DeepCT, and docTTTTT-
+query. All three rely on a traditional bag-of-words model (primarily
+BM25) for retrieval. Crucially, however, they re-weigh the frequency
+of terms per document and/or expand the set of terms in each doc-
+ument before building the BM25 index. In particular, doc2query
+expands each document with a pre-defined number of synthetic
+queries generated by a seq2seq transformer model (which docTTT-
+Tquery replaced with a pre-trained language model, T5 [ 31]). In
+contrast, DeepCT uses BERT to produce the term frequency com-
+ponent of BM25 in a context-aware manner.
+For the latency of Anserini’s BM25, doc2query, and docTTTT-
+query, we use the authors’ [ 26,28] Anserini-based implementation.
+While this implementation supports multi-threading, it only utilizes
+parallelism across different queries. We thus report single-threaded
+latency for these models, noting that simply parallelizing their com-
+putation over shards of the index can substantially decrease their
+already-low latency. For DeepCT, we only estimate its latency us-
+ing that of BM25 (as denoted by (est.) in the table), since DeepCT
+re-weighs BM25’s term frequency without modifying the index
+otherwise.10As discussed in §4.1, we use ColBERT L2for end-to-
+end retrieval, which employs negative squared L2 distance as its
+vector-similarity function. For its latency, we measure the time for
+faiss -based candidate filtering and the subsequent re-ranking. In
+this experiment, faiss uses all available CPU cores.
+Looking at Table 2, we first see Anserini’s BM25 baseline at 18.7
+MRR@10, noticing its very low latency as implemented in Anserini
+(which extends the well-known Lucene system), owing to both
+very cheap operations and decades of bag-of-words top- 𝑘retrieval
+optimizations. The three subsequent baselines, namely doc2query,
+DeepCT, and docTTTTquery, each brings a decisive enhancement
+to effectiveness. These improvements come at negligible overheads
+in latency, since these baselines ultimately rely on BM25-based
+retrieval. The most effective among these three, docTTTTquery,
+demonstrates a massive 9% gain over vanilla BM25 by fine-tuning
+the recent language model T5.
+9http://anserini.io/
+10In practice, a myriad of reasons could still cause DeepCT’s latency to differ
+slightly from BM25’s. For instance, the top- 𝑘pruning strategy employed, if any, could
+interact differently with a changed distribution of scores.
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+46Shifting our attention to ColBERT’s end-to-end retrieval effec-
+tiveness, we see its major gains in MRR@10 over all of these end-
+to-end models. In fact, using ColBERT in the end-to-end setup is su-
+perior in terms of MRR@10 to re-ranking with the same model due
+to the improved recall. Moving beyond MRR@10, we also see large
+gains in Recall@ 𝑘for𝑘equals to 50, 200, and 1000. For instance, its
+Recall@50 actually exceeds the official BM25’s Recall@1000 and
+even all but docTTTTTquery’s Recall@200, emphasizing the value
+of end-to-end retrieval (instead of just re-ranking) with ColBERT.
+4.4 Ablation Studies
+0.220.240.260.280.300.320.340.36
+MRR@10BERT [CLS]-based dot-product (5-layer)  [A]
+ColBERT via average similarity (5-layer)  [B]
+ColBERT without query augmentation (5-layer)  [C]
+ColBERT (5-layer)  [D]
+ColBERT (12-layer)  [E]
+ColBERT + e2e retrieval (12-layer)  [F]
+Figure 5: Ablation results on MS MARCO (Dev). Between
+brackets is the number of BERT layers used in each model.
+The results from §4.2 indicate that ColBERT is highly effective
+despite the low cost and simplicity of its late interaction mechanism.
+To better understand the source of this effectiveness, we examine a
+number of important details in ColBERT’s interaction and encoder
+architecture. For this ablation, we report MRR@10 on the validation
+set of MS MARCO in Figure 5, which shows our main re-ranking
+ColBERT model [E], with MRR@10 of 34.9%.
+Due to the cost of training all models, we train a copy of our
+main model that retains only the first 5 layers of BERT out of 12
+(i.e., model [D]) and similarly train all our ablation models for
+200k iterations with five BERT layers. To begin with, we ask if the
+fine-granular interaction in late interaction is necessary. Model [A]
+tackles this question: it uses BERT to produce a single embedding
+vector for the query and another for the document, extracted from
+BERT’s [CLS] contextualized embedding and expanded through a
+linear layer to dimension 4096 (which equals 𝑁𝑞×128=32×128).
+Relevance is estimated as the inner product of the query’s and the
+document’s embeddings, which we found to perform better than
+cosine similarity for single-vector re-ranking. As the results show,
+this model is considerably less effective than ColBERT, reinforcing
+the importance of late interaction.
+Subsequently, we ask if our MaxSim-based late interaction is bet-
+ter than other simple alternatives. We test a model [B] that replaces
+ColBERT’s maximum similarity with average similarity. The results
+suggest the importance of individual terms in the query paying
+special attention to particular terms in the document. Similarly,
+the figure emphasizes the importance of our query augmentation
+mechanism: without query augmentation [C], ColBERT has a no-
+ticeably lower MRR@10. Lastly, we see the impact of end-to-end
+retrieval not only on recall but also on MRR@10. By retrieving
+directly from the full collection, ColBERT is able to retrieve to the
+top-10 documents missed entirely from BM25’s top-1000.
+4.5 Indexing Throughput & Footprint
+Lastly, we examine the indexing throughput and space footprint
+of ColBERT. Figure 6 reports indexing throughput on MS MARCO
+0 10000 20000 30000 40000 50000
+Throughput (documents/minute)Basic ColBERT Indexing
++multi-GPU document processing
++per-batch maximum sequence length
++length-based bucketing
++multi-core pre-processingFigure 6: Effect of ColBERT’s indexing optimizations on the
+offline indexing throughput.
+documents with ColBERT and four other ablation settings, which
+individually enable optimizations described in §3.4 on top of basic
+batched indexing. Based on these throughputs, ColBERT can index
+MS MARCO in about three hours. Note that any BERT-based model
+must incur the computational cost of processing each document
+at least once. While ColBERT encodes each document with BERT
+exactly once, existing BERT-based rankers would repeat similar
+computations on possibly hundreds of documents for each query.
+Setting Dimension( 𝑚) Bytes/Dim Space(GiBs) MRR@10
+Re-rank Cosine 128 4 286 34.9
+End-to-end L2 128 2 154 36.0
+Re-rank L2 128 2 143 34.8
+Re-rank Cosine 48 4 54 34.4
+Re-rank Cosine 24 2 27 33.9
+Table 4: Space Footprint vs MRR@10 (Dev) on MS MARCO.
+Table 4 reports the space footprint of ColBERT under various
+settings as we reduce the embeddings dimension and/or the bytes
+per dimension. Interestingly, the most space-efficient setting, that
+is, re-ranking with cosine similarity with 24-dimensional vectors
+stored as 2-byte floats, is only 1% worse in MRR@10 than the most
+space-consuming one, while the former requires only 27 GiBs to
+represent the MS MARCO collection.
+5 CONCLUSIONS
+In this paper, we introduced ColBERT, a novel ranking model that
+employs contextualized late interaction over deep LMs (in particular,
+BERT) for efficient retrieval. By independently encoding queries
+and documents into fine-grained representations that interact via
+cheap and pruning-friendly computations, ColBERT can leverage
+the expressiveness of deep LMs while greatly speeding up query
+processing. Crucially, doing so allows scaling ColBERT to end-
+to-end neural retrieval directly from a large document collection,
+which can greatly improve recall over existing models. Our results
+show that ColBERT is two orders-of-magnitude faster than existing
+BERT-based models, all while only minimally impacting re-ranking
+quality and while outperforming every non-BERT baseline.
+Acknowledgments. OK was supported by the Eltoukhy Family
+Graduate Fellowship at the Stanford School of Engineering. This
+research was supported in part by affiliate members and other
+supporters of the Stanford DAWN project—Ant Financial, Facebook,
+Google, Infosys, NEC, and VMware—as well as Cisco, SAP, and the
+NSF under CAREER grant CNS-1651570. Any opinions, findings,
+and conclusions or recommendations expressed in this material are
+those of the authors and do not necessarily reflect the views of the
+National Science Foundation.
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+47REFERENCES
+[1]Firas Abuzaid, Geet Sethi, Peter Bailis, and Matei Zaharia. 2019. To Index or Not
+to Index: Optimizing Exact Maximum Inner Product Search. In 2019 IEEE 35th
+International Conference on Data Engineering (ICDE). IEEE, 1250–1261.
+[2]Zhuyun Dai and Jamie Callan. 2019. Context-Aware Sentence/Passage Term
+Importance Estimation For First Stage Retrieval. arXiv preprint arXiv:1910.10687
+(2019).
+[3]Zhuyun Dai and Jamie Callan. 2019. Deeper Text Understanding for IR with
+Contextual Neural Language Modeling. arXiv preprint arXiv:1905.09217 (2019).
+[4]Zhuyun Dai, Chenyan Xiong, Jamie Callan, and Zhiyuan Liu. 2018. Convolutional
+neural networks for soft-matching n-grams in ad-hoc search. In Proceedings of the
+eleventh ACM international conference on web search and data mining. 126–134.
+[5]Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2018. Bert:
+Pre-training of deep bidirectional transformers for language understanding. arXiv
+preprint arXiv:1810.04805 (2018).
+[6]Laura Dietz, Manisha Verma, Filip Radlinski, and Nick Craswell. 2017. TREC
+Complex Answer Retrieval Overview.. In TREC.
+[7]Jiafeng Guo, Yixing Fan, Qingyao Ai, and W Bruce Croft. 2016. A deep relevance
+matching model for ad-hoc retrieval. In Proceedings of the 25th ACM International
+on Conference on Information and Knowledge Management. ACM, 55–64.
+[8]Jiafeng Guo, Yixing Fan, Liang Pang, Liu Yang, Qingyao Ai, Hamed Zamani, Chen
+Wu, W Bruce Croft, and Xueqi Cheng. 2019. A deep look into neural ranking
+models for information retrieval. arXiv preprint arXiv:1903.06902 (2019).
+[9]Sebastian Hofstätter and Allan Hanbury. 2019. Let’s measure run time! Extending
+the IR replicability infrastructure to include performance aspects. arXiv preprint
+arXiv:1907.04614 (2019).
+[10] Sebastian Hofstätter, Navid Rekabsaz, Carsten Eickhoff, and Allan Hanbury. 2019.
+On the effect of low-frequency terms on neural-IR models. In Proceedings of
+the 42nd International ACM SIGIR Conference on Research and Development in
+Information Retrieval. 1137–1140.
+[11] Sebastian Hofstätter, Markus Zlabinger, and Allan Hanbury. 2019. TU Wien@
+TREC Deep Learning’19–Simple Contextualization for Re-ranking. arXiv preprint
+arXiv:1912.01385 (2019).
+[12] Po-Sen Huang, Xiaodong He, Jianfeng Gao, Li Deng, Alex Acero, and Larry
+Heck. 2013. Learning deep structured semantic models for web search using
+clickthrough data. In Proceedings of the 22nd ACM international conference on
+Information & Knowledge Management. 2333–2338.
+[13] Shiyu Ji, Jinjin Shao, and Tao Yang. 2019. Efficient Interaction-based Neural
+Ranking with Locality Sensitive Hashing. In The World Wide Web Conference.
+ACM, 2858–2864.
+[14] Xiaoqi Jiao, Yichun Yin, Lifeng Shang, Xin Jiang, Xiao Chen, Linlin Li, Fang Wang,
+and Qun Liu. 2019. Tinybert: Distilling bert for natural language understanding.
+arXiv preprint arXiv:1909.10351 (2019).
+[15] Jeff Johnson, Matthijs Douze, and Hervé Jégou. 2017. Billion-scale similarity
+search with GPUs. arXiv preprint arXiv:1702.08734 (2017).
+[16] Diederik P Kingma and Jimmy Ba. 2014. Adam: A method for stochastic opti-
+mization. arXiv preprint arXiv:1412.6980 (2014).
+[17] Ron Kohavi, Alex Deng, Brian Frasca, Toby Walker, Ya Xu, and Nils Pohlmann.
+2013. Online controlled experiments at large scale. In SIGKDD.
+[18] Sean MacAvaney, Andrew Yates, Arman Cohan, and Nazli Goharian. 2019. Cedr:
+Contextualized embeddings for document ranking. In Proceedings of the 42nd
+International ACM SIGIR Conference on Research and Development in Information
+Retrieval. ACM, 1101–1104.
+[19] Paul Michel, Omer Levy, and Graham Neubig. 2019. Are Sixteen Heads Really
+Better than One?. In Advances in Neural Information Processing Systems . 14014–
+14024.
+[20] Bhaskar Mitra and Nick Craswell. 2019. An Updated Duet Model for Passage
+Re-ranking. arXiv preprint arXiv:1903.07666 (2019).
+[21] Bhaskar Mitra, Nick Craswell, et al .2018. An introduction to neural information
+retrieval. Foundations and Trends® in Information Retrieval 13, 1 (2018), 1–126.
+[22] Bhaskar Mitra, Fernando Diaz, and Nick Craswell. 2017. Learning to match using
+local and distributed representations of text for web search. In Proceedings of the26th International Conference on World Wide Web. International World Wide Web
+Conferences Steering Committee, 1291–1299.
+[23] Bhaskar Mitra, Corby Rosset, David Hawking, Nick Craswell, Fernando Diaz,
+and Emine Yilmaz. 2019. Incorporating query term independence assumption
+for efficient retrieval and ranking using deep neural networks. arXiv preprint
+arXiv:1907.03693 (2019).
+[24] Tri Nguyen, Mir Rosenberg, Xia Song, Jianfeng Gao, Saurabh Tiwary, Rangan
+Majumder, and Li Deng. 2016. MS MARCO: A Human-Generated MAchine
+Reading COmprehension Dataset. (2016).
+[25] Rodrigo Nogueira and Kyunghyun Cho. 2019. Passage Re-ranking with BERT.
+arXiv preprint arXiv:1901.04085 (2019).
+[26] Rodrigo Nogueira, Jimmy Lin, and AI Epistemic. 2019. From doc2query to
+docTTTTTquery. (2019).
+[27] Rodrigo Nogueira, Wei Yang, Kyunghyun Cho, and Jimmy Lin. 2019. Multi-Stage
+Document Ranking with BERT. arXiv preprint arXiv:1910.14424 (2019).
+[28] Rodrigo Nogueira, Wei Yang, Jimmy Lin, and Kyunghyun Cho. 2019. Document
+Expansion by Query Prediction. arXiv preprint arXiv:1904.08375 (2019).
+[29] Matthew E Peters, Mark Neumann, Mohit Iyyer, Matt Gardner, Christopher
+Clark, Kenton Lee, and Luke Zettlemoyer. 2018. Deep contextualized word
+representations. arXiv preprint arXiv:1802.05365 (2018).
+[30] Yifan Qiao, Chenyan Xiong, Zhenghao Liu, and Zhiyuan Liu. 2019. Understanding
+the Behaviors of BERT in Ranking. arXiv preprint arXiv:1904.07531 (2019).
+[31] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang,
+Michael Matena, Yanqi Zhou, Wei Li, and Peter J Liu. 2019. Exploring the lim-
+its of transfer learning with a unified text-to-text transformer. arXiv preprint
+arXiv:1910.10683 (2019).
+[32] Stephen E Robertson, Steve Walker, Susan Jones, Micheline M Hancock-Beaulieu,
+Mike Gatford, et al. 1995. Okapi at TREC-3. NIST Special Publication (1995).
+[33] Raphael Tang, Yao Lu, Linqing Liu, Lili Mou, Olga Vechtomova, and Jimmy Lin.
+2019. Distilling task-specific knowledge from BERT into simple neural networks.
+arXiv preprint arXiv:1903.12136 (2019).
+[34] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all
+you need. In Advances in neural information processing systems. 5998–6008.
+[35] Yonghui Wu, Mike Schuster, Zhifeng Chen, Quoc V Le, Mohammad Norouzi,
+Wolfgang Macherey, Maxim Krikun, Yuan Cao, Qin Gao, Klaus Macherey, et al .
+2016. Google’s neural machine translation system: Bridging the gap between
+human and machine translation. arXiv preprint arXiv:1609.08144 (2016).
+[36] Chenyan Xiong, Zhuyun Dai, Jamie Callan, Zhiyuan Liu, and Russell Power. 2017.
+End-to-end neural ad-hoc ranking with kernel pooling. In Proceedings of the 40th
+International ACM SIGIR conference on research and development in information
+retrieval. 55–64.
+[37] Peilin Yang, Hui Fang, and Jimmy Lin. 2018. Anserini: Reproducible ranking
+baselines using Lucene. Journal of Data and Information Quality (JDIQ) 10, 4
+(2018), 1–20.
+[38] Wei Yang, Kuang Lu, Peilin Yang, and Jimmy Lin. 2019. Critically Examining
+the"" Neural Hype"" Weak Baselines and the Additivity of Effectiveness Gains
+from Neural Ranking Models. In Proceedings of the 42nd International ACM SIGIR
+Conference on Research and Development in Information Retrieval. 1129–1132.
+[39] Zeynep Akkalyoncu Yilmaz, Wei Yang, Haotian Zhang, and Jimmy Lin. 2019.
+Cross-domain modeling of sentence-level evidence for document retrieval. In
+Proceedings of the 2019 Conference on Empirical Methods in Natural Language Pro-
+cessing and the 9th International Joint Conference on Natural Language Processing
+(EMNLP-IJCNLP). 3481–3487.
+[40] Ofir Zafrir, Guy Boudoukh, Peter Izsak, and Moshe Wasserblat. 2019. Q8bert:
+Quantized 8bit bert. arXiv preprint arXiv:1910.06188 (2019).
+[41] Hamed Zamani, Mostafa Dehghani, W Bruce Croft, Erik Learned-Miller, and
+Jaap Kamps. 2018. From neural re-ranking to neural ranking: Learning a sparse
+representation for inverted indexing. In Proceedings of the 27th ACM International
+Conference on Information and Knowledge Management. ACM, 497–506.
+[42] Le Zhao. 2012. Modeling and solving term mismatch for full-text retrieval. Ph.D.
+Dissertation. Carnegie Mellon University.
+Session 1A: NeuIR and Semantic Matching 
+ 
+SIGIR ’20, July 25–30, 2020, Virtual Event, China
+48"
+1,2,https://arxiv.org/pdf/2104.07186.pdf,"COIL: Revisit Exact Lexical Match in Information Retrieval
+with Contextualized Inverted List
+Luyu Gao, Zhuyun Dai, Jamie Callan
+Language Technologies Institute
+Carnegie Mellon University
+{luyug, zhuyund, callan}@cs.cmu.edu
+Abstract
+Classical information retrieval systems such as
+BM25 rely on exact lexical match and carry
+out search efﬁciently with inverted list index.
+Recent neural IR models shifts towards soft
+semantic matching all query document terms,
+but they lose the computation efﬁciency of
+exact match systems. This paper presents
+COIL, a contextualized exact match retrieval
+architecture that brings semantic lexical match-
+ing. COIL scoring is based on overlapping
+query document tokens’ contextualized repre-
+sentations. The new architecture stores con-
+textualized token representations in inverted
+lists, bringing together the efﬁciency of exact
+match and the representation power of deep
+language models. Our experimental results
+show COIL outperforms classical lexical re-
+trievers and state-of-the-art deep LM retrievers
+with similar or smaller latency.1
+1 Introduction
+Widely used, bag-of-words (BOW) information re-
+trieval (IR) systems such as BM25 rely on exact
+lexical match2between query and document terms.
+Recent study in neural IR takes a different approach
+and compute soft matching between all query and
+document terms to model complex matching.
+The shift to soft matching in neural IR models
+attempts to address vocabulary mismatch problems,
+that query and the relevant documents use differ-
+ent terms, e.g. cat v.s. kitty, for the same con-
+cept (Huang et al., 2013; Guo et al., 2016; Xiong
+et al., 2017). Later introduction of contextualized
+representations (Peters et al., 2018) from deep lan-
+guage models (LM) further address semantic mis-
+match , that the same term can refer to different
+concepts, e.g., bank of river vs. bank in ﬁnance.
+Fine-tuned deep LM rerankers produce token rep-
+resentations based on context and achieve state-of-
+1Our code is available at https://github.com/
+luyug/COIL .
+2Exact match up to morphological changes.the-art in text ranking with huge performance leap
+(Nogueira and Cho, 2019; Dai and Callan, 2019b).
+Though the idea of soft matching all tokens is
+carried through the development of neural IR mod-
+els, seeing the success brought by deep LMs, we
+take a step back and ask: how much gain can we get
+if we introduce contextualized representations back
+to lexical exact match systems? In other words, can
+we build a system that still performs exact query-
+document token matching but compute matching
+signals with contextualized token representations
+instead of heuristics? This may seem a constraint
+on the model, but exact lexical match produce more
+explainable and controlled patterns than soft match-
+ing. It also allows search to focus on only the
+subset of documents that have overlapping terms
+with query, which can be done efﬁciently with in-
+verted list index. Meanwhile, using dense contex-
+tualized token representations enables the model
+to handle semantic mismatch, which has been a
+long-standing problem in classic lexical systems.
+To answer the question, we propose a new lexi-
+cal matching scheme that uses vector similarities
+between query-document overlapping term contex-
+tualized representations to replace heuristic scor-
+ing used in classical systems. We present COn-
+textualized Inverted List (COIL), a new exact lex-
+ical match retrieval architecture armed with deep
+LM representations. COIL processes documents
+with deep LM ofﬂine and produces representations
+for each document token. The representations are
+grouped by their surface tokens into inverted lists.
+At search time, we build representation vectors
+for query tokens and perform contextualized ex-
+act match: use each query token to look up its
+own inverted list and compute vector similarity
+with document vectors stored in the inverted list
+as matching scores. COIL enables efﬁcient search
+with rich-in-semantic matching between query and
+document.
+Our contributions include 1) introduce a novelarXiv:2104.07186v1  [cs.IR]  15 Apr 2021retrieval architecture, contextualized inverted
+lists (COIL) that brings semantic matching into
+lexical IR systems, 2) show matching signals in-
+duced from exact lexical match can capture com-
+plicated matching patterns, 3) demonstrate COIL
+signiﬁcantly outperform classical and deep LM
+augmented lexical retrievers as well as state-of-the-
+art dense retrievers on two retrieval tasks.
+2 Related Work
+Lexical Retriever Classical IR systems rely on
+exact lexical match retrievers such as Boolean
+Retrieval, BM25 (Robertson and Walker, 1994)
+and statistical language models (Lafferty and Zhai,
+2001). This type of retrieval model can process
+queries very quickly by organizing the documents
+into inverted index, where each distinct term has
+an inverted list that stores information about docu-
+ments it appears in. Nowadays, they are still widely
+used in production systems. However, these re-
+trieval models fall short of matching related terms
+(vocabulary mismatch) or modeling context of the
+terms (semantic mismatch). Much early effort
+was put into improving exact lexical match retriev-
+ers, such as matching n-grams (Metzler and Croft,
+2005) or expanding queries with terms from related
+documents (Lavrenko and Croft, 2001). However,
+these methods still use BOW framework and have
+limited capability of modeling human languages.
+Neural Ranker In order to deal with vocab-
+ulary mismatch, neural retrievers that rely on
+soft matching between numerical text represen-
+tations are introduced. Early attempts compute
+similarity between pre-trained word embedding
+such as word2vec (Mikolov et al., 2013) and
+GLoVe (Pennington et al., 2014) to produce match-
+ing score (Ganguly et al., 2015; Diaz et al., 2016).
+One more recent approach encodes query and doc-
+ument each into a vector and computes vector sim-
+ilarity (Huang et al., 2013). Later researches real-
+ized the limited capacity of a single vector to en-
+code ﬁne-grained information and introduced full
+interaction models to perform soft matching be-
+tween all term vectors (Guo et al., 2016; Xiong
+et al., 2017). In these approaches, scoring is
+based on learned neural networks and the hugely
+increased computation cost limited their use to
+reranking a top candidate list generated by a lexical
+retriever.Deep LM Based Ranker and Retriever Deep
+LM made a huge impact on neural IR. Fine-
+tuned Transformer (Vaswani et al., 2017) LM
+BERT (Devlin et al., 2019) achieved state-of-the-
+art reranking performance for passages and docu-
+ments (Nogueira and Cho, 2019; Dai and Callan,
+2019b). As illustrated in Figure 1a, the common
+approach is to feed the concatenated query docu-
+ment text through BERT and use BERT’s [CLS]
+output token to produce a relevance score. The
+deep LM rerankers addressed both vocabulary and
+semantic mismatch by computing full cross atten-
+tion between contextualized token representations.
+Lighter deep LM rankers are developed (MacA-
+vaney et al., 2020; Gao et al., 2020), but their cross
+attention operations are still too expensive for full-
+collection retrieval.
+Later research therefore resorted to augment-
+ing lexical retrieval with deep LMs by expanding
+the document surface form to narrow the vocab-
+ulary gap, e.g., DocT5Query (Nogueira and Lin,
+2019), or altering term weights to emphasize impor-
+tant terms, e.g., DeepCT (Dai and Callan, 2019a).
+Smartly combining deep LM retriever and reranker
+can offer additive gain for end performance (Gao
+et al., 2021a). These retrievers however still suffer
+from vocabulary and semantic mismatch as tradi-
+tional lexical retrievers.
+Another line of research continues the work on
+single vector representation and build dense retriev-
+ers, as illustrated in Figure 1b. They store docu-
+ment vectors in a dense index and retrieve them
+through Nearest Neighbours search. Using deep
+LMs, dense retrievers have achieved promising re-
+sults on several retrieval tasks (Karpukhin et al.,
+2020). Later researches show that dense retrieval
+systems can be further improved by better train-
+ing (Xiong et al., 2020; Gao et al., 2021b).
+Single vector systems have also been extended
+to multi-vector representation systems. Poly-
+encoder (Humeau et al., 2020) encodes queries
+into a set of vectors. Similarly, Me-BERT (Luan
+et al., 2020) represents documents with a set of vec-
+tors. A concurrent work ColBERT (Figure 1c) use
+multiple vectors to encode both queries and docu-
+ments (Khattab and Zaharia, 2020). In particular, it
+represents a documents with all its terms’ vectors
+and a query with an expanded set of term vectors.
+It then computes all-to-all (Cartesian) soft match
+between the tokens. ColBERT performs interaction
+as dot product followed pooling operations, whichCLS bank account SEP bank river bankCLS bank account SEP bank river bankCLS bank account SEP bank river bankCLS bank account SEP bank river bankscore(a) Cross-Attention Model (e.g., BERT reranker)
+CLS bank account CLS bank river bankCLS bank accountCLS bank account
+CLS bank river bankCLS bank river bankscore (b) Dense Retrievers (e.g., DPR)
+CLS bank account CLS bank river bankCLS bank accountCLS bank account
+CLS bank river bankCLS bank river bank
+EXP EXPscore
+max max max
+EXP
+EXPEXP
+EXPmax max
+(c) ColBERT: All-to-All Match
+CLS bank account CLS bank river bankCLS bank accountCLS bank account
+CLS bank river bankCLS bank river bankdot maxsum (d) COIL: Contextualized Exact Match
+Figure 1: An illustration of reranking/retrieval mechanisms with deep LM, including our proposed model, COIL.
+Bank
+River
+AccountBank
+Account
+Traditional Inverted Lists Querydocid: 3
+tf: 2docid: 9
+tf: 1docid: 1
+tf: 1docid: 2
+tf: 1docid: 4
+tf: 1docid: 5
+tf: 2docid: 1
+tf: 1docid: 3
+tf: 1docid: 6
+tf: 1....
+....BM25 
+scoringBM25 
+scoring
+BM25 
+scoring
+Figure 2: An illustration of traditional inverted lists.
+The inverted list maps a term to the list of documents
+where the term occurs. Retriever looks up query terms’
+inverted lists and scores those documents with stored
+statistics such as term frequency (tf).
+allows it to also leverage a dense index to do full
+corpus retrieval. However, since ColBERT encodes
+a document with all tokens, it adds another order
+of magnitude of index complexity to all aforemen-
+tioned methods: document tokens in the collection
+need to be stored in a single huge index and con-
+sidered at query time. Consequently, ColBERT is
+engineering and hardware demanding.
+3 Methodologies
+In this section, we ﬁrst provide some preliminaries
+on exact lexical match systems. Then we discuss
+COIL’s contextualized exact match design and how
+its search index is organized. We also give a com-
+parison between COIL and other popular retrievers.
+Bank
+River
+AccountBank
+Account
+Contextualized Inverted Lists Querydocid  [1 3 6 7]
+docid  [1 2 4 5 5 9]
+docid  [3 3 9]vectors
+vectors
+vectorsCLSdocid  [1 2 3 4 .............C]
+vectors ...CLSmatrix
+product
+matrix
+product
+matrix
+productFigure 3: COIL’s index and retrieval architecture.
+COIL-tok relies on the exact token matching (lower).
+COIL-full includes in addition CLS matching (upper).
+3.1 Preliminaries
+Classic lexical retrieval system relies on overlap-
+ping query document terms under morphological
+generalization like stemming, in other words, exact
+lexical match , to score query document pair. A
+scoring function is deﬁned as a sum of matched
+term scores. The scores are usually based on statis-
+tics like term frequency ( tf). Generally, we can
+write,
+s=X
+t2q\dt(hq(q;t);hd(d;t)) (1)
+where for each overlapping term tbetween query q
+and document d, functionshqandhdextract terminformation and a term scoring function tcom-
+bines them. A popular example is BM25, which
+computes,
+sBM25 =X
+t2q\didf(t)hBM25
+q(q;t)hBM25
+d(d;t)
+hBM25
+q(q;t) =tft;q(1 +k2)
+tft;q+k2
+hBM25
+d(d;t) =tft;d(1 +k1)
+tft;d+k1(1 b+bjdj
+avgdl)(2)
+wheretft;drefers to term frequency of term tin
+documentd,tft;qrefers to the term frequency in
+query,idf(t)is inverse document frequency, and b,
+k1,k2are hyper-parameters.
+One key advantage of exact lexical match sys-
+tems lies in efﬁciency. With summation over exact
+matches, scoring of each query term only goes to
+documents that contain matching terms. This can
+be done efﬁciently using inverted list indexing (Fig-
+ure 2). The inverted list maps back from a term
+to a list of documents where the term occurs. To
+compute Equation 1, the retriever only needs to
+traverse the subset of documents in query terms’
+inverted lists instead of going over the entire docu-
+ment collection.
+While recent neural IR research mainly focuses
+on breaking the exact match bottleneck with soft
+matching of text, we hypothesize that exact match
+itself can be improved by replacing semantic in-
+dependent frequency-based scoring with semantic
+rich scoring. In the rest of this section, we show
+how to modify the exact lexical match framework
+with contextualized term representations to build
+effective and efﬁcient retrieval systems.
+3.2 Contextualized Exact Lexical Match
+Instead of term frequency, we desire to encode
+the semantics of terms to facilitate more effective
+matching. Inspired by recent advancements in deep
+LM, we encode both query and document tokens
+into contextualized vector representations and carry
+out matching between exact lexical matched tokens.
+Figure 1d illustrates the scoring model of COIL.
+In this work, we use a Transformer language
+model3as the contextualization function. We en-
+code a query qwith the language model (LM) and
+represent its i-th token by projecting the corre-
+sponding output:
+vq
+i=WtokLM(q;i) +btok (3)
+3We used the base, uncased variant of BERT.where Wntnlm
+tokis a matrix that maps the LM’s
+nlmdimension output into a vector of lower di-
+mensionnt. We down project the vectors as we
+hypothesize that it sufﬁces to use lower dimension
+token vectors. We conﬁrm this in section 5. Simi-
+larly, we encode a document d’sj-th tokendjwith:
+vd
+j=WtokLM(d;j) +btok (4)
+We then deﬁne the contextualized exact lexical
+match scoring function between query document
+based on vector similarities between exact matched
+query document token pairs:
+stok(q;d) =X
+qi2q\dmax
+dj=qi(vq
+i|vd
+j) (5)
+Note that, importantly, the summation goes through
+only overlapping terms, qi2q\d. For each query
+tokenqi, we ﬁnds all same tokensdjin the docu-
+ment, computes their similarity with qiusing the
+contextualized token vectors. The maximum sim-
+ilarities are picked for query token qi. Max op-
+erator is adopted to capture the most important
+signal (Kim, 2014). This ﬁts in the general lexical
+match formulation, with hqgiving representation
+forqi,htgiving representations for all dj=qi, and
+tcompute dot similarities between query vector
+with document vectors and max pool the scores.
+As with classic lexical systems, stokdeﬁned in
+Equation 5 does not take into account similarities
+between lexical-different terms, thus faces vocabu-
+lary mismatch. Many popular LMs (Devlin et al.,
+2019; Yang et al., 2019; Liu et al., 2019) use a
+special CLS token to aggregate sequence represen-
+tation. We project the CLS vectos with Wncnlm
+cls
+to represent the entire query or document,
+vq
+cls=WclsLM(q;CLS) +bcls
+vd
+cls=WclsLM(d;CLS) +bcls(6)
+The similarity between vq
+clsandvd
+clsprovides high-
+level semantic matching and mitigates the issue of
+vocabulary mismatch. The full form of COIL is:
+sfull(q;d) =stok(q;d) +vq
+cls|vd
+cls (7)
+In the rest of the paper, we refer to systems with
+CLS matching COIL-full and without COIL-tok .
+COIL’s scoring model (Figure 1d) is fully differ-
+entiable. Following earlier work (Karpukhin et al.,
+2020), we train COIL with negative log likelihood
+deﬁned over query q, a positive document d+and aset of negative documents fd 
+1;d 
+2;::d 
+l::gas loss.
+L= logexp(s(q;d+))
+exp(s(q;d+)) +P
+lexp(s(q;d 
+l))
+(8)
+Following Karpukhin et al. (2020), we use in batch
+negatives and hard negatives generated by BM25.
+Details are discussed in implementation, section 4.
+3.3 Index and Retrieval with COIL
+COIL pre-computes the document representations
+and builds up a search index, which is illustrated in
+Figure 3. Documents in the collection are encoded
+ofﬂine into token and CLS vectors. Formally, for
+a unique token tin the vocabulary V, we collect
+its contextualized vectors from all of its mentions
+from documents in collection C, building token t’s
+contextualized inverted list:
+It=fvd
+jjdj=t;d2Cg; (9)
+where vd
+jis the BERT-based token encoding de-
+ﬁned in Equation 4. We deﬁne search index to
+store inverted lists for all tokens in vocabulary,
+I=fItjt2Vg. For COIL-full, we also build an
+index for the CLS token Icls=fvd
+clsjd2Cg.
+As shown in Figure 3, in this work we im-
+plement COIL’s by stacking vectors in each in-
+verted listItinto a matrix MntjIkj, so that sim-
+ilarity computation that traverses an inverted list
+and computes vector dot product can be done ef-
+ﬁciently as one matrix-vector product with opti-
+mized BLAS (Blackford et al., 2002) routines on
+CPU or GPU. All vd
+clsvectors can also be organized
+in a similar fashion into matrix Mclsand queried
+with matrix product. The matrix implementation
+here is an exhaustive approach that involves all vec-
+tors in an inverted list. As a collection of dense
+vectors, it is also possible to organize each inverted
+list as an approximate search index (Johnson et al.,
+2017; Guo et al., 2019) to further speed up search.
+When a query qcomes in, we encode every of
+its token into vectors vq
+i. The vectors are sent to
+the subset of COIL inverted lists that corresponds
+query tokens J=fItjt2qg. where the matrix
+product described above is carried out. This is
+efﬁcient asjJj<<jIj, having only a small subset
+of all inverted lists to be involved in search. For
+COIL-full, we also use encoded CLS vectors vq
+cls
+to query the CLS index to get the CLS matching
+scores. The scoring over different inverted lists canserve in parallel. The scores are then combined by
+Equation 5 to rank the documents.
+Readers can ﬁnd detailed illustration ﬁgures in
+the Appendix A, for index building and querying,
+Figure 4 and Figure 5, respectively.
+3.4 Connection to Other Retrievers
+Deep LM based Lexical Index Models like
+DeepCT (Dai and Callan, 2019a, 2020) and
+DocT5Query (Nogueira and Lin, 2019) alter tft;d
+in documents with deep LM BERT or T5. This is
+similar to a COIL-tok with token dimension nt= 1.
+A single degree of freedom however measures more
+of a term importance than semantic agreement .
+Dense Retriever Dense retrievers (Figure 1b)
+are equivalent to COIL-full’s CLS matching. COIL
+makes up for the lost token-level interactions in
+dense retriever with exact matching signals.
+ColBERT ColBERT (Figure 1c) computes rel-
+evance by soft matching allquery and document
+term’s contextualized vectors.
+s(q;d) =X
+qi2[cls;q;exp]max
+dj2[cls;d](vq
+i|vd
+j) (10)
+where interactions happen among query q, docu-
+mentd,clsand set of query expansion tokens exp.
+The all-to-all match contrasts COIL that only uses
+exact match. It requires a dense retrieval over all
+document tokens’ representations as opposed to
+COIL which only considers query’s overlapping to-
+kens, and are therefore much more computationally
+expensive than COIL.
+4 Experiment Methodologies
+Datasets We experiment with two large scale ad
+hoc retrieval benchmarks from the TREC 2019
+Deep Learning (DL) shared task: MSMARCO
+passage (8M English passages of average length
+around 60 tokens) and MSMARCO document (3M
+English documents of average length around 900
+tokens)4. For each, we train models with the
+MSMARCO Train queries, and record results on
+MSMARCO Dev queries and TREC DL 2019
+test queries. We report mainly full-corpus re-
+trieval results but also include the rerank task on
+MSMARCO Dev queries where we use neural
+scores to reorder BM25 retrieval results provided
+by MSMARO organizers. Ofﬁcial metrics include
+4Both datasets can be downloaded from https://
+microsoft.github.io/msmarco/MRR@1K and NDCG@10 on test and MRR@10
+on MSMARCO Dev. We also report recall for the
+dev queries following prior work (Dai and Callan,
+2019a; Nogueira and Lin, 2019).
+Compared Systems Baselines include 1) tradi-
+tional exact match system BM25, 2) deep LM aug-
+mented BM25 systems DeepCT (Dai and Callan,
+2019a) and DocT5Query (Nogueira and Lin, 2019),
+3) dense retrievers, and 4) soft all-to-all retriever
+ColBERT. For DeepCT and DocT5Query, we use
+the rankings provided by the authors. For dense
+retrievers, we report two dense retrievers trained
+with BM25 negatives or with mixed BM25 and
+random negatives, published in Xiong et al. (2020).
+However since these systems use a robust version
+of BERT, RoBERTa (Liu et al., 2019) as the LM
+and train document retriever also on MSMARCO
+passage set, we in addition reproduce a third dense
+retriever, that uses the exact same training setup as
+COIL. All dense retrievers use 768 dimension em-
+bedding. For ColBERT, we report its published re-
+sults (available only on passage collection). BERT
+reranker is added in the rerank task.
+We include 2 COIL systems: 1) COIL-tok, the
+exact token match only system, and 2) COLL-full,
+the model with both token match and CLS match.
+Implementation We build our models with Py-
+torch (Paszke et al., 2019) based on huggingface
+transformers (Wolf et al., 2019). COIL’s LM is
+based on BERT’s base variant. COIL systems use
+token dimension nt= 32 and COIL-full use CLS
+dimensionnc= 768 as default, leading to 110M
+parameters. We add a Layer Normalization to CLS
+vector when useful. All models are trained for 5
+epochs with AdamW optimizer, a learning rate of
+3e-6, 0.1 warm-up ratio, and linear learning rate
+decay, which takes around 12 hours. Hard neg-
+atives are sampled from top 1000 BM25 results.
+Each query uses 1 positive and 7 hard negatives;
+each batch uses 8 queries on MSMARCO passage
+and 4 on MSMARCO document. Documents are
+truncated to the ﬁrst 512 tokens to ﬁt in BERT.
+We conduct validation on randomly selected 512
+queries from corresponding train set. Latency num-
+bers are measured on dual Xeon E5-2630 v3 for
+CPU and RTX 2080 ti for GPU. We implement
+COIL’s inverted lists as matrices as described in
+subsection 3.3, using NumPy (Harris et al., 2020)
+on CPU and Pytorch on GPU. We perform a) a set
+of matrix products to compute token similaritiesover contextualized inverted lists, b) scatter to map
+token scores back to documents, and c) sort to rank
+the documents. Illustration can be found in the
+appendix, Figure 5.
+5 Results
+This section studies the effectiveness of COIL
+and how vector dimension in COIL affects the
+effectiveness-efﬁciency tradeoff. We also provide
+qualitative analysis on contextualized exact match.
+5.1 Main Results
+Table 1 reports various systems’ performance on
+the MARCO passage collection. COIL-tok ex-
+act lexical match only system signiﬁcantly out-
+performs all previous lexical retrieval systems.
+With contextualized term similarities, COIL-tok
+achieves a MRR of 0.34 compared to BM25’s MRR
+0.18. DeepCT and DocT5Query, which also use
+deep LMs like BERT and T5, are able to break the
+limit of heuristic term frequencies but are still lim-
+ited by semantic mismatch issues. We see COIL-
+tok outperforms both systems by a large margin.
+COIL-tok also ranks top of the candidate list bet-
+ter than dense retrieves. It prevails in MRR and
+NDCG while performs on par in recall with the
+best dense system, indicating that COIL’s token
+level interaction can improve precision. With the
+CLS matching added, COIL-full gains the ability
+to handle mismatched vocabulary and enjoys an-
+other performance leap, outperforming all dense
+retrievers.
+COIL-full achieves a very narrow performance
+gap to ColBERT. Recall that ColBERT computes
+all-to-all soft matches between all token pairs. For
+retrieval, it needs to consider for each query token
+allmentions of alltokens in the collection (MS-
+MARCO passage collection has around 500M to-
+ken mentions). COIL-full is able to capture match-
+ing patterns as effectively with exact match signals
+from only query tokens’ mentions and a single CLS
+matching to bridge the vocabulary gap.
+We observe a similar pattern in the rerank task.
+COIL-tok is already able to outperform dense re-
+triever and COIL-full further adds up to perfor-
+mance with CLS matching, being on-par with Col-
+BERT. Meanwhile, previous BERT rerankers have
+little performance advantage over COIL5. In prac-
+tice, we found BERT rerankers to be much more
+5Close performance between COIL and BERT rerankers
+is partially due to the bottleneck of BM25 candidates.Table 1: MSMARCO passage collection results. Results not applicable are denoted ‘–’ and no available ‘n.a.’.
+MS MARCO Passage Ranking
+Dev Rerank Dev Retrieval DL2019 Retrieval
+Model MRR@10 MRR@10 Recall@1K NDCG@10 MRR@1K
+Lexical Retriever
+BM25 – 0.184 0.853 0.506 0.825
+DeepCT – 0.243 0.909 0.572 0.883
+DocT5Query – 0.278 0.945 0.642 0.888
+BM25+BERT reranker 0.347 – – – –
+Dense Retriever
+Dense (BM25 neg) n.a. 0.299 0.928 0.600 n.a.
+Dense (rand + BM25 neg) n.a. 0.311 0.952 0.576 n.a.
+Dense (our train) 0.312 0.304 0.932 0.635 0.898
+ColBERT 0.349 0.360 0.968 n.a. n.a.
+COIL-tok 0.336 0.341 0.949 0.660 0.915
+COIL-full 0.348 0.355 0.963 0.704 0.924
+Table 2: MSMARCO document collection results. Results not applicable are denoted ‘–’ and no available ‘n.a.’.
+MS MARCO Document Ranking
+Dev Rerank Dev Retrieval DL2019 Retrieval
+Model MRR@10 MRR@10 Recall@1K NDCG@10 MRR@1K
+Lexical Retriever
+BM25 – 0.230 0.886 0.519 0.805
+DeepCT – 0.320 0.942 0.544 0.891
+DocT5Query – 0.288 0.926 0.597 0.837
+BM25+BERT reranker 0.383 – – – –
+Dense Retriever
+Dense (BM25 neg) n.a. 0.299 0.928 0.600 n.a.
+Dense (rand + BM25 neg) n.a. 0.311 0.952 0.576 n.a.
+Dense (our train) 0.358 0.340 0.883 0.546 0.785
+COIL-tok 0.381 0.385 0.952 0.626 0.921
+COIL-full 0.388 0.397 0.962 0.636 0.913
+expensive, requiring over 2700 ms for reranking
+compared to around 10ms in the case of COIL.
+Table 2 reports the results on MSMARCO docu-
+ment collection. In general, we observe a similar
+pattern as with the passage case. COIL systems
+signiﬁcantly outperform both lexical and dense sys-
+tems in MRR and NDCG and retain a small advan-
+tage measured in recall. The results suggest that
+COIL can be applicable to longer documents with
+a consistent advantage in effectiveness.
+The results indicate exact lexical match mecha-
+nism can be greatly improved with the introduction
+of contextualized representation in COIL. COIL’s
+token-level match also yields better ﬁne-grained
+signals than dense retriever’s global match signal.
+COIL-full further combines the lexical signals with
+dense CLS match, forming a system that can deal
+with both vocabulary and semantic mismatch, be-
+ing as effective as all-to-all system.5.2 Analysis of Dimensionality
+The second experiment tests how varying COIL’s
+token dimension ntand CLS dimension ncaffect
+model effectiveness and efﬁciency. We record re-
+trieval performance and latency on MARCO pas-
+sage collection in Table 3.
+In COIL-full systems, reducing CLS dimension
+from 768 to 128 leads to a small drop in perfor-
+mance on the Dev set, indicating that a full 768
+dimension may not be necessary for COIL. Keep-
+ing CLS dimension at 128, systems with token
+dimension 32 and 8 have very small performance
+difference, suggesting that token-speciﬁc semantic
+consumes much fewer dimensions. Similar pattern
+inntis also observed in COIL-tok ( nc= 0).
+On the DL2019 queries, we observe that reduc-
+ing dimension actually achieves better MRR. We
+believe this is due to a regulatory effect, as theTable 3: Performance and latency of COIL systems with different representation dimensions. Results not applica-
+ble are denoted ‘–’ and no available ‘n.a.’. Here ncdenotes COIL CLS dimension and nttoken vector dimension.
+*: ColBERT use approximate search and quantization. We exclude I/O time from measurements.
+Dev Retrieval DL2019 Retrieval Latency/ms
+Model MRR@10 Recall@1K NDCG@10 MRR CPU GPU
+BM25 0.184 0.853 0.506 0.825 36 n.a.
+Dense 0.304 0.932 0.635 0.898 293 32
+ColBERT 0.360 0.968 n.a. n.a. 458* –
+COIL
+ncnt
+768 32 0.355 0.963 0.704 0.924 380 41
+128 32 0.350 0.953 0.692 0.956 125 23
+128 8 0.347 0.956 0.694 0.977 113 21
+0 32 0.341 0.949 0.660 0.915 67 18
+0 8 0.336 0.940 0.678 0.953 55 16
+Table 4: Sample query document pairs with similarity scores produced by COIL. Tokens in examination are colored
+blue. Numbers in brackets are query-document vector similarities computed with vectors generated by COIL.
+Query Token COIL Contextualized Exact Match Score Relevance
+what is a cabinet in govtCabinet [16.28] (government) A cabinet [16.75] is a body of high-
+ranking state ofﬁcials, typically consisting of the top leaders of the ....+
+Cabinet [7.23] is 20x60 and top is 28x72. .... I had a 2cm granite counter-
+top installed with a 10 inch overhang on one side and a 14 inch....-
+what is priority passPriority Pass [11.61] is an independent airport lounge access program. A
+membership provides you with access to their network of over 700 ....+
+Snoqualmie Pass [7.98] is a mountain pass [6.83] that carries Interstate
+90 through the Cascade Range in the U.S. State of Washington....-
+what isnjstartNJSTART is [1.25] a self-service online platform that allows vendors to
+manage forms, certiﬁcations, submit proposals, access training ....+
+Contract awardees will receive their Blanket P.O. once it is [-0.10] con-
+verted, and details regarding that process will also be sent...-
+test queries were labeled differently from the MS-
+MARCO train/dev queries (Craswell et al., 2020).
+We also record CPU and GPU search latency
+in Table 3. Lowering COIL-full’s CLS dimen-
+sion from 768 to 128 gives a big speedup, making
+COIL faster than DPR system. Further dropping
+token dimensions provide some extra speedup. The
+COIL-tok systems run faster than COIL-full, with a
+latency of the same order of magnitude as the tradi-
+tional BM25 system. Importantly, lower dimension
+COIL systems still retain a performance advantage
+over dense systems while being much faster. We
+include ColBERT’s latency reported in the original
+paper, which was optimized by approximate search
+and quantization. All COIL systems have lower
+latency than ColBERT even though our current im-
+plementation does not use those optimization tech-
+niques. We however note that approximate search
+and quantization are applicable to COIL, and leave
+the study of speeding up COIL to future work.5.3 Case Study
+COIL differs from all previous embedding-based
+models in that it does not use a single uniﬁed em-
+bedding space. Instead, for a speciﬁc token, COIL
+learns an embedding space to encode and measure
+the semantic similarity of the token in different
+contexts. In this section, we show examples where
+COIL differentiates different senses of a word un-
+der different contexts. In Table 4, we show how
+the token similarity scores differ across contexts in
+relevant and irrelevant query document pairs.
+The ﬁrst query looks for “cabinet” in the context
+of “govt” (abbreviation for “government”). The
+two documents both include query token ""cabinet""
+but of a different concept. The ﬁrst one refers to
+the government cabinet and the second to a case
+or cupboard. COIL manages to match “cabinet” in
+the query to “cabinet” in the ﬁrst document with
+a much higher score. In the second query, ""pass""
+in both documents refer to the concept of permis-sion. However, through contextualization, COIL
+captures the variation of the same concept and as-
+signs a higher score to “pass” in the ﬁrst document.
+Stop words like “it”, “a”, and “the” are com-
+monly removed in classic exact match IR systems
+as they are not informative on their own. In the
+third query, on the other hand, we observe that
+COIL is able to differentiate “is” in an explanatory
+sentence and “is” in a passive form, assigning the
+ﬁrst higher score to match query context.
+All examples here show that COIL can go be-
+yond matching token surface form and introduce
+rich context information to estimate matching. Dif-
+ferences in similarity scores across mentions under
+different contexts demonstrate how COIL systems
+gain strength over lexical systems.
+6 Conclusion and Future Work
+Exact lexical match systems have been widely used
+for decades in classical IR systems and prove to be
+effective and efﬁcient. In this paper, we point out
+a critical problem, semantic mismatch, that gener-
+ally limits all IR systems based on surface token
+for matching. To ﬁx semantic mismatch, we in-
+troduce contextualized exact match to differentiate
+the same token in different contexts, providing ef-
+fective semantic-aware token match signals. We
+further propose contextualized inverted list (COIL)
+search index which swaps token statistics in in-
+verted lists with contextualized vector representa-
+tions to perform effective search.
+On two large-scale ad hoc retrieval benchmarks,
+we ﬁnd COIL substantially improves lexical re-
+trieval and outperforms state-of-the-art dense re-
+trieval systems. These results indicate large head-
+room of the simple-but-efﬁcient exact lexical match
+scheme. When the introduction of contextualiza-
+tion handles the issue of semantic mismatch, exact
+match system gains the capability of modeling com-
+plicated matching patterns that were not captured
+by classical systems.
+V ocabulary mismatch in COIL can also be
+largely mitigated with a high-level CLS vector
+matching. The full system performs on par with
+more expensive and complex all-to-all match re-
+trievers. The success of the full system also shows
+that dense retrieval and COIL’s exact token match-
+ing give complementary effects, with COIL making
+up dense system’s lost token level matching signals
+and dense solving the vocabulary mismatch proba-
+bly for COIL.With our COIL systems showing viable search
+latency, we believe this paper makes a solid step
+towards building next-generation index that stores
+semantics. At the intersection of lexical and neural
+systems, efﬁcient algorithms proposed for both can
+push COIL towards real-world systems.References
+S. Blackford, J. Demmel, J. Dongarra, I. Duff, S. Ham-
+marling, Greg Henry, M. Héroux, L. Kaufman, An-
+drew Lumsdaine, A. Petitet, R. Pozo, K. Remington,
+and C. Whaley. 2002. An updated set of basic linear
+algebra subprograms (blas). ACM Transactions on
+Mathematical Software , 28.
+Nick Craswell, Bhaskar Mitra, Emine Yilmaz, Daniel
+Campos, and Ellen M V oorhees. 2020. Overview
+of the trec 2019 deep learning track. arXiv preprint
+arXiv:2003.07820 .
+Zhuyun Dai and J. Callan. 2019a. Context-aware sen-
+tence/passage term importance estimation for ﬁrst
+stage retrieval. ArXiv , abs/1910.10687.
+Zhuyun Dai and J. Callan. 2020. Context-aware docu-
+ment term weighting for ad-hoc search. Proceedings
+of The Web Conference 2020 .
+Zhuyun Dai and Jamie Callan. 2019b. Deeper text un-
+derstanding for IR with contextual neural language
+modeling. In Proceedings of the 42nd International
+ACM SIGIR Conference on Research and Develop-
+ment in Information Retrieval, SIGIR 2019, Paris,
+France, July 21-25, 2019 , pages 985–988. ACM.
+J. Devlin, Ming-Wei Chang, Kenton Lee, and Kristina
+Toutanova. 2019. Bert: Pre-training of deep bidirec-
+tional transformers for language understanding. In
+NAACL-HLT .
+Fernando Diaz, Bhaskar Mitra, and Nick Craswell.
+2016. Query expansion with locally-trained word
+embeddings. In Proceedings of the 54th Annual
+Meeting of the Association for Computational Lin-
+guistics .
+Debasis Ganguly, Dwaipayan Roy, Mandar Mitra,
+and Gareth J. F. Jones. 2015. Word embedding
+based generalized language model for information
+retrieval. In Proceedings of the 38th International
+ACM SIGIR Conference on Research and Develop-
+ment in Information Retrieval .
+Luyu Gao, Zhuyun Dai, and Jamie Callan. 2020. Mod-
+ularized transfomer-based ranking framework. In
+Proceedings of the 2020 Conference on Empirical
+Methods in Natural Language Processing, EMNLP
+2020, Online, November 16-20, 2020 . Association
+for Computational Linguistics.
+Luyu Gao, Zhuyun Dai, and Jamie Callan. 2021a. Re-
+think training of BERT rerankers in multi-stage re-
+trieval pipeline. In Advances in Information Re-
+trieval - 43rd European Conference on IR Research,
+ECIR 2021, Virtual Event, March 28 - April 1, 2021,
+Proceedings, Part II .
+Luyu Gao, Zhuyun Dai, Tongfei Chen, Zhen Fan, Ben-
+jamin Van Durme, and Jamie Callan. 2021b. Com-
+plement lexical retrieval model with semantic resid-
+ual embeddings. In Advances in Information Re-
+trieval - 43rd European Conference on IR Research,ECIR 2021, Virtual Event, March 28 - April 1, 2021,
+Proceedings, Part I .
+J. Guo, Y . Fan, Qingyao Ai, and W. Croft. 2016. A
+deep relevance matching model for ad-hoc retrieval.
+Proceedings of the 25th ACM International on Con-
+ference on Information and Knowledge Manage-
+ment .
+R. Guo, Philip Y . Sun, E. Lindgren, Quan Geng, David
+Simcha, Felix Chern, and S. Kumar. 2019. Accel-
+erating large-scale inference with anisotropic vector
+quantization. arXiv: Learning .
+Charles R. Harris, K. Jarrod Millman, Stéfan J
+van der Walt, Ralf Gommers, Pauli Virtanen, David
+Cournapeau, Eric Wieser, Julian Taylor, Sebas-
+tian Berg, Nathaniel J. Smith, Robert Kern, Matti
+Picus, Stephan Hoyer, Marten H. van Kerkwijk,
+Matthew Brett, Allan Haldane, Jaime Fernández del
+Río, Mark Wiebe, Pearu Peterson, Pierre Gérard-
+Marchant, Kevin Sheppard, Tyler Reddy, Warren
+Weckesser, Hameer Abbasi, Christoph Gohlke, and
+Travis E. Oliphant. 2020. Array programming with
+NumPy. Nature .
+Po-Sen Huang, Xiaodong He, Jianfeng Gao, Li Deng,
+Alex Acero, and Larry Heck. 2013. Learning deep
+structured semantic models for web search using
+clickthrough data. In Proceedings of the 22nd ACM
+international conference on Information & Knowl-
+edge Management .
+Samuel Humeau, Kurt Shuster, Marie-Anne Lachaux,
+and J. Weston. 2020. Poly-encoders: Architec-
+tures and pre-training strategies for fast and accurate
+multi-sentence scoring. In ICLR .
+J. Johnson, M. Douze, and H. Jégou. 2017. Billion-
+scale similarity search with gpus. ArXiv ,
+abs/1702.08734.
+V . Karpukhin, Barlas O ˘guz, Sewon Min, Patrick
+Lewis, Ledell Yu Wu, Sergey Edunov, Danqi
+Chen, and W. Yih. 2020. Dense passage re-
+trieval for open-domain question answering. ArXiv ,
+abs/2004.04906.
+O. Khattab and M. Zaharia. 2020. Colbert: Efﬁcient
+and effective passage search via contextualized late
+interaction over bert. Proceedings of the 43rd Inter-
+national ACM SIGIR Conference on Research and
+Development in Information Retrieval .
+Yoon Kim. 2014. Convolutional neural networks for
+sentence classiﬁcation. In EMNLP .
+John Lafferty and Chengxiang Zhai. 2001. Document
+language models, query models, and risk minimiza-
+tion for information retrieval. In Proceedings of the
+24th Annual International ACM SIGIR Conference
+on Research and Development in Information Re-
+trieval .Victor Lavrenko and W. Bruce Croft. 2001. Relevance-
+based language models. In Proceedings of the 24th
+Annual International ACM SIGIR Conference on Re-
+search and Development in Information Retrieval .
+Y . Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar
+Joshi, Danqi Chen, Omer Levy, M. Lewis, Luke
+Zettlemoyer, and Veselin Stoyanov. 2019. Roberta:
+A robustly optimized bert pretraining approach.
+ArXiv , abs/1907.11692.
+Yi Luan, Jacob Eisenstein, Kristina Toutanova, and
+M. Collins. 2020. Sparse, dense, and atten-
+tional representations for text retrieval. ArXiv ,
+abs/2005.00181.
+Sean MacAvaney, F. Nardini, R. Perego, N. Tonellotto,
+Nazli Goharian, and O. Frieder. 2020. Efﬁcient doc-
+ument re-ranking for transformers by precomputing
+term representations. Proceedings of the 43rd Inter-
+national ACM SIGIR Conference on Research and
+Development in Information Retrieval .
+Donald Metzler and W. Bruce Croft. 2005. A markov
+random ﬁeld model for term dependencies. In SIGIR
+2005: Proceedings of the 28th Annual International
+ACM SIGIR Conference on Research and Develop-
+ment in Information Retrieval .
+Tomas Mikolov, Ilya Sutskever, Kai Chen, G. S. Cor-
+rado, and J. Dean. 2013. Distributed representations
+of words and phrases and their compositionality. In
+NIPS .
+Rodrigo Nogueira and Kyunghyun Cho. 2019. Passage
+re-ranking with bert. ArXiv , abs/1901.04085.
+Rodrigo Nogueira and Jimmy Lin. 2019. From
+doc2query to doctttttquery.
+Adam Paszke, Sam Gross, Francisco Massa, Adam
+Lerer, James Bradbury, Gregory Chanan, Trevor
+Killeen, Zeming Lin, Natalia Gimelshein, Luca
+Antiga, Alban Desmaison, Andreas Kopf, Edward
+Yang, Zachary DeVito, Martin Raison, Alykhan Te-
+jani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang,
+Junjie Bai, and Soumith Chintala. 2019. Py-
+torch: An imperative style, high-performance deep
+learning library. In H. Wallach, H. Larochelle,
+A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Gar-
+nett, editors, Advances in Neural Information Pro-
+cessing Systems 32 . Curran Associates, Inc.
+Jeffrey Pennington, R. Socher, and Christopher D.
+Manning. 2014. Glove: Global vectors for word rep-
+resentation. In EMNLP .
+Matthew E. Peters, Mark Neumann, Mohit Iyyer, Matt
+Gardner, Christopher Clark, Kenton Lee, and Luke
+Zettlemoyer. 2018. Deep contextualized word repre-
+sentations. ArXiv , abs/1802.05365.
+Stephen E Robertson and Steve Walker. 1994. Some
+simple effective approximations to the 2-poissonmodel for probabilistic weighted retrieval. In Pro-
+ceedings of the 17th Annual International ACM-
+SIGIR Conference on Research and Development in
+Information Retrieval .
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+Uszkoreit, Llion Jones, Aidan N. Gomez, L. Kaiser,
+and Illia Polosukhin. 2017. Attention is all you need.
+InNIPS .
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+Chaumond, Clement Delangue, Anthony Moi, Pier-
+ric Cistac, Tim Rault, Rémi Louf, Morgan Funtow-
+icz, Joe Davison, Sam Shleifer, Patrick von Platen,
+Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu,
+Teven Le Scao, Sylvain Gugger, Mariama Drame,
+Quentin Lhoest, and Alexander M. Rush. 2019.
+Huggingface’s transformers: State-of-the-art natural
+language processing. ArXiv , abs/1910.03771.
+Chenyan Xiong, Zhuyun Dai, J. Callan, Zhiyuan Liu,
+and R. Power. 2017. End-to-end neural ad-hoc rank-
+ing with kernel pooling. Proceedings of the 40th
+International ACM SIGIR Conference on Research
+and Development in Information Retrieval .
+Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang,
+J. Liu, P. Bennett, Junaid Ahmed, and Arnold Over-
+wijk. 2020. Approximate nearest neighbor negative
+contrastive learning for dense text retrieval. ArXiv ,
+abs/2007.00808.
+Z. Yang, Zihang Dai, Yiming Yang, J. Carbonell,
+R. Salakhutdinov, and Quoc V . Le. 2019. Xlnet:
+Generalized autoregressive pretraining for language
+understanding. In NeurIPS .A Appendix
+A.1 Index Building Illustration
+The following ﬁgure demonstrates how the document ""apple pie baked ..."" is indexed by COIL. The
+document is ﬁrst processed by a ﬁne-tuned deep LM to produce for each token a contextualized vector.
+The vectors of each term ""apple"" and ""juice"" are collected to the corresponding inverted list index along
+with the document id for lookup.
+apple
+LM
+uapple
+v
+appleDocument #10 - apple pie baked ...
+10
+v
+pie10u
+vpie baked
+vpie wbaked
+v10
+w
+baked
+Figure 4: COIL Index Building of document ""apple pie baked...""A.2 Search Illustration
+The following ﬁgure demonstrates how the query ""apple juice"" is processed by COIL. Contextualized
+vectors of each term ""apple"" and ""juice"" go to the corresponding inverted list index consisting of a lookup
+id array and a matrix stacked from document term vectors. For each index, a matrix vector product is run
+to produce an array of scores. Afterwards a max-scatter of scores followed by a sortproduces the ﬁnal
+ranking. Note for each index, we show only operations for a subset of vectors (3 vectors) in the index
+matrix.
+v u776
+zyx776
+ScoreIdxzyx ScoreIndexapple
+v w975
+rqp975
+ScoreIdxrqp ScoreIndexjuice
+SortMatrix V ector Product
+Max Scatter
+SortingQuery: apple juice
+Figure 5: COIL Search of query ""apple juice""."
+2,3,https://arxiv.org/pdf/2106.14807.pdf,"A Few Brief Notes on DeepImpact, COIL, and a Conceptual
+Framework for Information Retrieval Techniques
+Jimmy Lin andXueguang Ma
+David R. Cheriton School of Computer Science
+University of Waterloo
+Abstract
+Recent developments in representational learn-
+ing for information retrieval can be organized
+in a conceptual framework that establishes two
+pairs of contrasts: sparse vs. dense representa-
+tions and unsupervised vs. learned representa-
+tions. Sparse learned representations can fur-
+ther be decomposed into expansion and term
+weighting components. This framework al-
+lows us to understand the relationship between
+recently proposed techniques such as DPR,
+ANCE, DeepCT, DeepImpact, and COIL, and
+furthermore, gaps revealed by our analysis
+point to “low hanging fruit” in terms of tech-
+niques that have yet to be explored. We present
+a novel technique dubbed “uniCOIL”, a simple
+extension of COIL that achieves to our knowl-
+edge the current state-of-the-art in sparse re-
+trieval on the popular MS MARCO passage
+ranking dataset. Our implementation using
+the Anserini IR toolkit is built on the Lucene
+search library and thus fully compatible with
+standard inverted indexes.
+1 Introduction
+We present a novel conceptual framework for un-
+derstanding recent developments in information re-
+trieval that organizes techniques along two dimen-
+sions. The ﬁrst dimension establishes the contrast
+between sparse and dense vector representations
+for queries and documents.1The second dimen-
+sion establishes the contrast between unsupervised
+and learned (supervised) representations. Figure 1
+illustrates our framework.
+Recent proposals for dense retrieval, exempliﬁed
+by DPR (Karpukhin et al., 2020) and ANCE (Xiong
+et al., 2021), but also encompassing many other
+techniques (Gao et al., 2021b; Hofstätter et al.,
+2020; Qu et al., 2021; Hofstätter et al., 2021; Lin
+1Consistent with parlance in information retrieval, we use
+“document” throughout this paper in a generic sense to refer to
+the unit of retrieved text. To be more precise, our experiments
+are in fact focused on passage retrieval.Dense Sparse
+Supervised DPR, ANCE DeepImpact, COIL
+Unsupervised LSI, LDA BM25, tf–idf
+Table 1: Our conceptual framework for organizing re-
+cent developments in information retrieval.
+et al., 2021), can be understood as learned dense
+representations for retrieval. This is formulated
+as a representational learning problem where the
+task is to learn (transformer-based) encoders that
+map queries and documents into dense ﬁxed-width
+vectors (768 dimensions is typical) in which inner
+products between queries and relevant documents
+are maximized, based on supervision signals from
+a large dataset such as the MS MARCO passage
+ranking test collection (Bajaj et al., 2018). See Lin
+et al. (2020) for a survey.
+Dense retrieval techniques are typically com-
+pared against a bag-of-words exact match ranking
+model such as BM25, which in this context can be
+understood as unsupervised sparse retrieval. Al-
+though it may be unnatural to describe BM25 in
+this way, it is technically accurate: each document
+is represented by a sparse vector where each dimen-
+sion corresponds to a unique term in the vocabulary,
+and the scoring function assigns a weight to each di-
+mension. As with dense retrieval, query–document
+scores are computed via inner products.
+What about learned sparse retrieval? The most
+prominent recent example of this in the literature
+is DeepCT (Dai and Callan, 2019), which uses
+a transformer to learn term weights based on a re-
+gression model, with the supervision signal coming
+from the MS MARCO passage ranking test collec-
+tion.2DeepCT has an interesting “quirk”: in truth,
+it only learns the term frequency (tf) component
+of term weights, but still relies on the remaining
+2Learning sparse representations is by no means a new idea.
+The earliest example we are aware of is Wilbur (2001), who
+attempted to learn global term weights using TREC data, but
+the idea likely dates back even further.arXiv:2106.14807v1  [cs.IR]  28 Jun 2021parts of the BM25 scoring function via the gen-
+eration of pseudo-documents. This approach also
+has a weakness: it only assigns weights to terms
+that are already present in the document, which
+limits retrieval to exact match. This is an impor-
+tant limitation that is addressed by the use of dense
+representations, which are capable of capturing se-
+mantic matches.
+These two issues were resolved by the recently
+proposed DeepImpact model (Mallia et al., 2021),
+which also belongs in the family of learned sparse
+representations. DeepImpact brought together two
+key ideas: the use of document expansion to iden-
+tify dimensions in the sparse vector that should
+have non-zero weights and a term weighting model
+based on a pairwise loss between relevant and non-
+relevant texts with respect to a query. Expansion
+terms were identiﬁed by doc2query–T5 (Nogueira
+and Lin, 2019), a sequence-to-sequence model for
+document expansion that predicts queries for which
+a text would be relevant. Since the DeepImpact
+scoring model directly predicts term weights that
+are then quantized, it would be more accurate to
+call these weights learned impacts, since query–
+document scores are simply the sum of weights of
+document terms that are found in the query. Calling
+these impact scores draws an explicit connection to
+a thread of research in information retrieval dating
+back two decades (Anh et al., 2001).
+The recently proposed COIL architecture (Gao
+et al., 2021a) presents an interesting case for this
+conceptual framework. Where does it belong? The
+authors themselves describe COIL as “a new ex-
+act lexical match retrieval architecture armed with
+deep LM representations”. COIL produces repre-
+sentations for each document token that are then
+directly stored in the inverted index, where the
+term frequency usually goes in an inverted list.
+Although COIL is perhaps best described as the
+intellectual descendant of ColBERT (Khattab and
+Zaharia, 2020), another way to think about it within
+our conceptual framework is that instead of assign-
+ingscalar weights to terms in a query, the “scoring”
+model assigns each term a vector “weight”. Query
+evaluation in COIL involves accumulating inner
+products instead of scalar weights.
+Our conceptual framework highlights a ﬁnal
+class of techniques: unsupervised dense represen-
+tations. While there is little work in this space of
+late, it does describe techniques such as LSI (Deer-
+wester et al., 1990; Atreya and Elkan, 2010) andLDA (Wei and Croft, 2006), which have been previ-
+ously explored. Thus, all quadrants in our proposed
+conceptual framework are populated with known
+examples from the literature.
+2 Comments and Observations
+Based on this framework, we can make a number of
+interesting observations that highlight obvious next
+steps in the development of retrieval techniques.
+We discuss as follows:
+Choice of bases. Retrieval techniques using learned
+dense representations and learned sparse represen-
+tations present an interesting contrast. Nearly all
+recent proposals take advantage of transformers, so
+that aspect of the design is not a salient difference.
+The critical contrast is the basis of the vector rep-
+resentations: In sparse approaches, the basis of the
+vector space remains ﬁxed to the corpus vocabulary,
+and thus techniques such as DeepCT, COIL, and
+DeepImpact can be understood as term weighting
+models. In dense approaches, the model is given
+the freedom to choose a new basis derived from
+transformer representations. This change in basis
+allows the encoder to represent the “meaning” of
+texts in relatively small ﬁxed-width vectors (com-
+pared to sparse vectors that may have millions of
+dimensions). This leads us to the next important
+observation:
+Expansions for sparse representation. Without
+some form of expansion, learned sparse represen-
+tations remain limited to (better) exact matching
+between queries and documents. The nature of
+sparse representations means that it is impractical
+to consider non-zero weights for allelements in
+the vector (i.e., the vocabulary space). Thus, docu-
+ment expansion serves the critical role of proposing
+a set of candidate terms that should receive non-
+zero weights; since the number of candidate terms
+is small compared to the vocabulary size, the re-
+sulting vector remains sparse. Without expansion,
+learned sparse representations cannot address the
+vocabulary mismatch problem (Furnas et al., 1987),
+because document terms not present in the query
+cannot contribute any score. For DeepImpact, this
+expansion is performed by doc2query–T5, but in
+principle we can imagine other methods also. This
+leads us to the next important observation:
+Relating DeepCT, DeepImpact, and COIL. The up-
+shot of the above analysis is that retrieval tech-
+niques based on learned sparse representations
+should be divided into an expansion model andSparse Representations MRR@10 Notes
+Term Weighting Expansion
+(1a) BM25 None 0.184 copied from (Nogueira and Lin, 2019)
+(1b) BM25 doc2query–T5 0.277 copied from (Nogueira and Lin, 2019)
+(2a) DeepCT None 0.243 copied from (Dai and Callan, 2019)
+(2b) DeepCT doc2query–T5 ? no publicly reported ﬁgure
+(2c) DeepImpact None ? no publicly reported ﬁgure
+(2d) DeepImpact doc2query–T5 0.326 copied from (Mallia et al., 2021)
+(2e) COIL-tok ( d= 32 ) None 0.341 copied from (Gao et al., 2021a)
+(2f) COIL-tok ( d= 32 ) doc2query–T5 0.361 our experiment
+(2g) uniCOIL None 0.315 our experiment
+(2h) uniCOIL doc2query–T5 0.352 our experiment
+Dense Representations MRR@10 Notes
+(3a) ColBERT 0.360 copied from (Khattab and Zaharia, 2020)
+(3b) ANCE 0.330 copied from (Xiong et al., 2021)
+(3c) DistillBERT 0.323 copied from (Hofstätter et al., 2020)
+(3d) RocketQA 0.370 copied from (Qu et al., 2021)
+(3e) TAS-B 0.347 copied from (Hofstätter et al., 2021)
+(3f) TCT-ColBERTv2 0.359 copied from (Lin et al., 2021)
+Dense–Sparse Hybrids MRR@10 Notes
+(4a) CLEAR 0.338 copied from (Gao et al., 2021b)
+(4b) COIL-full 0.355 copied from (Gao et al., 2021a)
+(4c) TCT-ColBERTv2 + BM25 (1a) 0.369 copied from (Lin et al., 2021)
+(4d) TCT-ColBERTv2 + doc2query–T5 (1b) 0.375 copied from (Lin et al., 2021)
+(4e) TCT-ColBERTv2 + DeepImpact (2d) 0.378 our experiment
+(4f) TCT-ColBERTv2 + uniCOIL (2h) 0.378 our experiment
+(4g) TCT-ColBERTv2 + COIL (2f) 0.382 our experiment
+Table 2: Results on the development queries of the MS MARCO passage ranking task.
+a term weighting model. For example, DeepCT
+performs no expansion and uses a regression-based
+scoring model. DeepImpact performs document ex-
+pansion and uses a pairwise scoring model. COIL
+performs no expansion and uses a “scoring” model
+that generates a contextualized “weight vector” (in-
+stead of a scalar weight). This breakdown suggests
+a number of obvious experiments that help us un-
+derstand the contributions of these components,
+which we report next.
+3 Experiments
+Our proposed conceptual framework can be used
+to organize results from the literature, which are
+shown in Table 2 on the development queries of
+the MS MARCO passage ranking task (Bajaj et al.,
+2018). Some of these entries represent ﬁgures di-
+rectly copied from previous papers (with references
+shown), while others are novel experimental condi-
+tions that we report.
+The ﬁrst main block of the table shows retrieval
+with sparse representations. Row (1a) shows the
+BM25 baseline, and row (1b) provides the effective-
+ness of doc2query–T5 expansion. In both cases, the
+term weights are from the BM25 scoring function,and hence unsupervised. Learned sparse retrieval
+techniques are shown in row group (2). Separat-
+ing the term weighting component from the ex-
+pansion component allows us to identify gaps in
+model conﬁgurations that would be interesting to
+explore. For example, in row (2a), DeepCT pro-
+posed a regression-based term weighting model,
+but performed no expansion. However, the term
+weighting model can be applied to expanded doc-
+uments, as in row (2b); to our knowledge, this
+conﬁguration has not been publicly reported.
+Similarly, DeepImpact combined doc2query–T5
+as an expansion model and a term weighting model
+trained with pairwise loss. To better understand
+the contributions of each component, we could
+run the term weighting model without document
+expansion, as outlined in row (2c). This ablation
+experiment was not reported in Mallia et al. (2021),
+but would be interesting to conduct.
+In row (2e) we report the published results of
+COIL-tok (token dimension d= 32 ), which is the
+sparse component in the full COIL model (which
+is a dense–sparse hybrid). Through the lens of
+our conceptual framework, a number of extensions
+become immediately obvious. COIL can be com-bined with doc2query–T5. Using source code pro-
+vided by the authors,3we trained such a model
+from scratch, using the same hyperparameters as
+the authors. This variant leads to a nearly two-point
+gain in effectiveness, as shown in row (2f).
+In another interesting extension, if we reduce the
+token dimension of COIL to one, the model degen-
+erates into producing scalar weights, which then
+becomes directly comparable to DeepCT, row (2a)
+and the “no-expansion” variant of DeepImpact, row
+(2c). These comparisons isolate the effects of differ-
+ent term weighting models. We dub this variant of
+COIL “uniCOIL”, on top of which we can also add
+doc2query–T5, which produces a fair comparison
+to DeepImpact, row (2d). The original formulation
+of COIL, even with a token dimension of one, is
+not directly amenable to retrieval using inverted
+indexes because weights can be negative. To ad-
+dress this issue, we added a ReLU operation on
+the output term weights of the base COIL model to
+force the model to generate non-negative weights.
+Once again, we retrained the model from scratch
+using the same hyperparameters provided by the
+authors. When encoding the corpus, we quantized
+these weights into 8 bits to obtain impact scores;
+query weights are similarly quantized. After these
+modiﬁcations, uniCOIL is directly compatible with
+inverted indexes. Our experimental results are re-
+ported with the Anserini toolkit (Yang et al., 2017,
+2018), which is built on Lucene.
+It is no surprise that uniCOIL without doc2query–
+T5, row (2g), is less effective than COIL-tok ( d=
+32), row (2e). However, uniCOIL with doc2query–
+T5, row (2h), outperforms COIL-tok without need-
+ing any specialized retrieval infrastructure—the
+weights are just impact scores, like in DeepImpact.
+These results suggest that contextualized “weight
+vectors” in COIL aren’t necessary to achieve good
+effectiveness—adding expansion appears sufﬁcient
+to make up for the lost expressivity of weight vec-
+tors, as shown in row (2h) vs. row (2e). To our
+knowledge, our uniCOIL model, row (2h), repre-
+sents the state of the art in sparse retrieval using
+learned impact weights, beating DeepImpact by
+around two points.
+The second main block of Table 2 provides a
+number of comparable dense retrieval results from
+the literature. The highest score that we are aware
+of is RocketQA (Qu et al., 2021), whose effective-
+ness beats all known sparse conﬁgurations. Note
+3https://github.com/luyug/COILthat ColBERT (Khattab and Zaharia, 2020) uses
+the more expressive MaxSim operator to compare
+query and document representations; all other tech-
+niques use inner products.
+The ﬁnal block of Table 2 presents the results of
+dense–sparse hybrids. Lin et al. (2021) reported
+the results of dense–sparse hybrids when TCT-
+ColBERTv2, row (3f), is combined with BM25,
+row (1a), and doc2query–T5, row (1b). To this,
+we added fusion with DeepImpact, uniCOIL, and
+COIL-tok (d= 32 ). For a fair comparison, we fol-
+lowed the same technique for combining dense and
+sparse results as Lin et al. (2021), which is from Ma
+et al. (2021). For each query q, we used the corre-
+sponding dense and sparse techniques to retrieve
+top-1k documents. The ﬁnal fusion score of each
+document is calculated by sdense +ssparse . Since
+the range of the two different scores are quite differ-
+ent, we ﬁrst normalized the scores into range(0, 1).
+Thewas tuned in the range(0, 2) with a simple
+line search on a subset of the MS MARCO passage
+training set.
+With these hybrid combinations, we are able
+to achieve, to our knowledge, the highest reported
+scores on the MS MARCO passage ranking task for
+single-stage techniques (i.e., no reranking). Note
+that, as before, uniCOIL is compatible with stan-
+dard inverted indexes, unlike COIL-tok, which re-
+quires custom infrastructure.
+4 Next Steps
+In most recent work, dense retrieval techniques are
+compared to BM25 and experiments show that they
+handily win. However, this is not a fair compari-
+son, since BM25 is unsupervised, whereas dense
+retrieval techniques exploit supervised relevance
+signals from large datasets. A more appropriate
+comparison would be between learned dense vs.
+sparse representations—and there, no clear win-
+ner emerges at present. However, it seems clear
+that they are complementary, as hybrid approaches
+appear to be more effective than either alone.
+An important point to make here is that neu-
+ral networks, particularly transformers, have not
+made sparse representations obsolete. Both dense
+and sparse learned representations clearly exploit
+transformers—the trick is that the latter class of
+techniques then “projects” the learned knowledge
+back into the sparse vocabulary space. This al-
+lows us to reuse decades of innovation in inverted
+indexes (e.g., integer coding techniques to com-press inverted lists) and efﬁcient query evaluation
+algorithms (e.g., smart skipping to reduce query
+latency): for example, the Lucene index used in
+our uniCOIL experiments is only 1.3 GB, com-
+pared to 40 GB for COIL-tok, 26 GB for TCT-
+ColBERTv2, and 154 GB for ColBERT. We note,
+however, that with dense retrieval techniques, ﬁxed-
+width vectors can be approximated with binary
+hash codes, yielding far more compact representa-
+tions with sacriﬁcing much effectiveness (Yamada
+et al., 2021). Once again, no clear winner emerges
+at present.
+The complete design space of modern informa-
+tion retrieval techniques requires proper accounting
+of the tradeoffs between output quality (effective-
+ness), time (query latency), and space (index size).
+Here, we have only focused on the ﬁrst aspect.
+Learned representations for information retrieval
+are clearly the future, but the advantages and dis-
+advantages of dense vs. sparse approaches along
+these dimensions are not yet fully understood. It’ll
+be exciting to see what comes next!
+5 Acknowledgments
+This research was supported in part by the Canada
+First Research Excellence Fund and the Natural Sci-
+ences and Engineering Research Council (NSERC)
+of Canada. Computational resources were provided
+by Compute Ontario and Compute Canada.
+References
+V o Ngoc Anh, Owen de Kretser, and Alistair Moffat.
+2001. Vector-space ranking with effective early ter-
+mination. In Proceedings of the 24th Annual Inter-
+national ACM SIGIR Conference on Research and
+Development in Information Retrieval (SIGIR 2001) ,
+pages 35–42, New Orleans, Louisiana.
+Avinash Atreya and Charles Elkan. 2010. Latent se-
+mantic indexing (LSI) fails for TREC collections.
+SIGKDD Explorations , 12(2):5–10.
+Payal Bajaj, Daniel Campos, Nick Craswell, Li Deng,
+Jianfeng Gao, Xiaodong Liu, Rangan Majumder,
+Andrew McNamara, Bhaskar Mitra, Tri Nguyen,
+Mir Rosenberg, Xia Song, Alina Stoica, Saurabh Ti-
+wary, and Tong Wang. 2018. MS MARCO: A Hu-
+man Generated MAchine Reading COmprehension
+Dataset. arXiv:1611.09268v3 .
+Zhuyun Dai and Jamie Callan. 2019. Context-aware
+sentence/passage term importance estimation for
+ﬁrst stage retrieval. arXiv:1910.10687 .
+Scott Deerwester, Susan T. Dumais, George W. Furnas,
+Thomas K. Landauer, and Richard Harshman. 1990.Indexing by latent semantic analysis. Journal of
+the Association for Information Science , 41(6):391–
+407.
+George W. Furnas, Thomas K. Landauer, Louis M.
+Gomez, and Susan T. Dumais. 1987. The vo-
+cabulary problem in human-system communication.
+Communications of the ACM , 30(11):964–971.
+Luyu Gao, Zhuyun Dai, and Jamie Callan. 2021a.
+COIL: Revisit exact lexical match in information
+retrieval with contextualized inverted list. In Pro-
+ceedings of the 2021 Conference of the North Amer-
+ican Chapter of the Association for Computational
+Linguistics: Human Language Technologies , pages
+3030–3042.
+Luyu Gao, Zhuyun Dai, Tongfei Chen, Zhen Fan, Ben-
+jamin Van Durme, and Jamie Callan. 2021b. Com-
+plementing lexical retrieval with semantic residual
+embedding. In Proceedings of the 43rd European
+Conference on Information Retrieval (ECIR 2021),
+Part I , pages 146–160.
+Sebastian Hofstätter, Sophia Althammer, Michael
+Schröder, Mete Sertkan, and Allan Hanbury.
+2020. Improving efﬁcient neural ranking mod-
+els with cross-architecture knowledge distillation.
+arXiv:2010.02666 .
+Sebastian Hofstätter, Sheng-Chieh Lin, Jheng-Hong
+Yang, Jimmy Lin, and Allan Hanbury. 2021. Ef-
+ﬁciently teaching an effective dense retriever with
+balanced topic aware sampling. In Proceedings of
+the 44th Annual International ACM SIGIR Confer-
+ence on Research and Development in Information
+Retrieval (SIGIR 2021) .
+Vladimir Karpukhin, Barlas O ˘guz, Sewon Min, Patrick
+Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and
+Wen-tau Yih. 2020. Dense passage retrieval for
+open-domain question answering. In Proceedings of
+the 2020 Conference on Empirical Methods in Nat-
+ural Language Processing (EMNLP) , pages 6769–
+6781.
+Omar Khattab and Matei Zaharia. 2020. ColBERT: Ef-
+ﬁcient and effective passage search via contextual-
+ized late interaction over BERT. In Proceedings of
+the 43rd International ACM SIGIR Conference on
+Research and Development in Information Retrieval
+(SIGIR 2020) , pages 39–48.
+Jimmy Lin, Rodrigo Nogueira, and Andrew Yates.
+2020. Pretrained transformers for text ranking:
+BERT and beyond. arXiv:2010.06467 .
+Sheng-Chieh Lin, Jheng-Hong Yang, and Jimmy Lin.
+2021. In-batch negatives for knowledge distillation
+with tightly-coupled teachers for dense retrieval. In
+Proceedings of the 6th Workshop on Representation
+Learning for NLP .
+Xueguang Ma, Kai Sun, Ronak Pradeep, and Jimmy
+Lin. 2021. A replication study of dense passage re-
+triever. arXiv:2104.05740 .Antonio Mallia, Omar Khattab, Torsten Suel, and
+Nicola Tonellotto. 2021. Learning passage impacts
+for inverted indexes. In Proceedings of the 44th An-
+nual International ACM SIGIR Conference on Re-
+search and Development in Information Retrieval
+(SIGIR 2021) .
+Rodrigo Nogueira and Jimmy Lin. 2019. From
+doc2query to docTTTTTquery.
+Yingqi Qu, Yuchen Ding, Jing Liu, Kai Liu, Ruiyang
+Ren, Wayne Xin Zhao, Daxiang Dong, Hua Wu,
+and Haifeng Wang. 2021. RocketQA: An opti-
+mized training approach to dense passage retrieval
+for open-domain question answering. In Proceed-
+ings of the 2021 Conference of the North Ameri-
+can Chapter of the Association for Computational
+Linguistics: Human Language Technologies , pages
+5835–5847.
+Xing Wei and W. Bruce Croft. 2006. LDA-based doc-
+ument models for ad-hoc retrieval. In Proceedings
+of the 29th Annual International ACM SIGIR Con-
+ference on Research and Development in Informa-
+tion Retrieval (SIGIR 2006) , pages 178–185, Seattle,
+Washington.
+W. John Wilbur. 2001. Global term weights for docu-
+ment retrieval learned from TREC data. Journal of
+Information Science , 27(5):303–310.
+Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang,
+Jialin Liu, Paul N. Bennett, Junaid Ahmed, and
+Arnold Overwijk. 2021. Approximate nearest neigh-
+bor negative contrastive learning for dense text re-
+trieval. In Proceedings of the 9th International Con-
+ference on Learning Representations (ICLR 2021) .
+Ikuya Yamada, Akari Asai, and Hannaneh Ha-
+jishirzi. 2021. Efﬁcient passage retrieval with
+hashing for open-domain question answering.
+arXiv:2106.00882 .
+Peilin Yang, Hui Fang, and Jimmy Lin. 2017. Anserini:
+enabling the use of Lucene for information retrieval
+research. In Proceedings of the 40th Annual Inter-
+national ACM SIGIR Conference on Research and
+Development in Information Retrieval (SIGIR 2017) ,
+pages 1253–1256, Tokyo, Japan.
+Peilin Yang, Hui Fang, and Jimmy Lin. 2018. Anserini:
+reproducible ranking baselines using Lucene. Jour-
+nal of Data and Information Quality , 10(4):Article
+16."
+3,4,https://arxiv.org/pdf/2301.03266.pdf,"Doc2Query--: When Less is More
+Mitko Gospodinov1, Sean MacAvaney2, and Craig Macdonald2
+University of Glasgow
+12024810G@student.gla.ac.uk
+2{first}.{last}@glasgow.ac.uk
+Abstract. Doc2Query — the process of expanding the content of a
+document before indexing using a sequence-to-sequence model — has
+emerged as a prominent technique for improving the ﬁrst-stage retrieval
+eﬀectivenessofsearchengines.However,sequence-to-sequencemodelsare
+known to be prone to “hallucinating” content that is not present in the
+source text. We argue that Doc2Query is indeed prone to hallucination,
+which ultimately harms retrieval eﬀectiveness and inﬂates the index size.
+In this work, we explore techniques for ﬁltering out these harmful queries
+prior to indexing. We ﬁnd that using a relevance model to remove poor-
+quality queries can improve the retrieval eﬀectiveness of Doc2Query by
+up to 16%, while simultaneously reducing mean query execution time by
+23% and cutting the index size by 33%. We release the code, data, and
+a live demonstration to facilitate reproduction and further exploration.1
+1 Introduction
+Neural network models, particularly those based on contextualised language
+models, have been shown to improve search eﬀectiveness [3]. While some ap-
+proaches focus on re-ranking document sets from a ﬁrst-stage retrieval function
+to improve precision [27], others aim to improve the ﬁrst stage itself [4]. In this
+work, we focus on one of these ﬁrst-stage approaches: Doc2Query [29]. This ap-
+proach trains a sequence-to-sequence model (e.g., T5 [33]) to predict queries that
+may be relevant to a particular text. Then, when indexing, this model is used
+toexpandthe document by generating a collection of queries and appending
+them to the document. Though computationally expensive at index time [34],
+this approach has been shown to be remarkably eﬀective even when retrieving
+using simple lexical models like BM25 [28]. Numerous works have shown that
+the approach can produce a high-quality pool of results that are eﬀective for
+subsequent stages in the ranking pipeline [19,20,23,40].
+However, sequence-to-sequence models are well-known to be prone to gener-
+ate content that does not reﬂect the input text – a defect known in literature
+as “hallucination” [25]. We ﬁnd that existing Doc2Query models are no excep-
+tion. Figure 1 provides example generated queries from the state-of-the-art T5
+Doc2Query model [28]. In this example, we see that many of the generated
+queries cannot actually be answered by the source passage (score 1).
+1https://github.com/terrierteam/pyterrier_doc2queryarXiv:2301.03266v3  [cs.IR]  27 Feb 20232 Gospodinov et al.
+Original Passage: Barley (Hordeum vulgare L.), a
+member of the grass family, is a major cereal grain. It
+was one of the ﬁrst cultivated grains and is now grown
+widely. Barley grain is a staple in Tibetan cuisine and
+waseatenwidelybypeasantsinMedievalEurope.Bar-
+ley has also been used as animal fodder, as a source
+of fermentable material for beer and certain distilled
+beverages,andasacomponentofvarioushealthfoods.Generated Queries: (1) where does barley originate
+from(2) what is the name of the cereal grain used
+in tibetan cooking? (3) what is barley used for (1)
+what is barley in food (0) what is bare wheat (3)
+what family of organisms is barley in (1) why is bar-
+ley important in tibetan diet (3) what is barley 
+(2) where is barley grown (1) where was barley ﬁrst
+grown and eaten (1) where was barley ﬁrst used ...
+Fig. 1.Example passage from MS MARCO and generated queries using the T5
+Doc2Query model. The relevance of each query to the passage is scored by the au-
+thors on a scale of 0–3 using the TREC Deep Learning passage relevance criteria.
+Based on this observation, we hypothesise that retrieval performance of
+Doc2Querywouldimproveifhallucinatedquerieswereremoved.Inthispaper,we
+conduct experiments where we apply a new ﬁltering phase that aims to remove
+poor queries prior to indexing. Given that this approach removes queries, we
+call the approach Doc2Query-- (Doc2Query-minus-minus). Rather than training
+a new model for this task, we identify that relevance models are already ﬁt for
+this purpose: they estimate how relevant a passage is to a query. We therefore
+explore ﬁltering strategies that make use of existing neural relevance models.
+Through experimentation on the MS MARCO dataset, we ﬁnd that our ﬁl-
+tering approach can improve the retrieval eﬀectiveness of indexes built using
+Doc2Query-- by up to 16%; less can indeed be more. Meanwhile, ﬁltering nat-
+urally reduces the index size, lowering storage and query-time computational
+costs. Finally, we conduct an exploration of the index-time overheads introduced
+bytheﬁlteringprocessandconcludethatthegainsfromﬁlteringmorethanmake
+up for the additional time spent generating more queries. The approach also has
+a positive impact on the environmental costs of applying Doc2Query; the same
+retrieval eﬀectiveness can be achieved with only about a third of the compu-
+tational cost when indexing. To facilitate last-metre, last-mile, and complete
+reproduction eﬀorts [36], we release the code, indices, and ﬁltering scores.1In
+summary, we contribute a technique to improve the eﬀectiveness and eﬃciency
+of Doc2Query by ﬁltering out queries that do not reﬂect the original passage.
+2 Related Work
+The classical lexical mismatch problem is a key one in information retrieval -
+documents that do not contain the query terms may not be retrieved. In the
+literature, various approaches have addressed this: query reformulation – includ-
+ing stemming, query expansion models (e.g. Rocchio, Bo1 [1], RM3 [12]) – and
+document expansion [9,30,35]. Classically, query expansion models have been
+popular, as they avoid the costs associated with making additional processing
+for each document needed for document expansion. However, query expansion
+may result in reduced performance [11], as queries are typically short and the
+necessary evidence to understand the context of the user is limited.Doc2Query--: When Less is More 3
+The application of latent representations of queries and documents, such
+as using latent semantic indexing [8] allow retrieval to not be driven directly
+by lexical signals. More recently, transformer-based language models (such as
+BERT [6]) have resulted in representations of text where the contextualised
+meaning of words are accounted for. In particular, in dense retrieval, queries
+and documents are represented in embeddings spaces [14,37], often facilitated
+by Approximate Nearest Neighbour (ANN) data structures [13]. However, even
+when using ANN, retrieval can still be ineﬃcient or insuﬃciently eﬀective [15].
+Others have explored approaches for augmenting lexical representations with
+additional terms that may be relevant. In this work, we explore Doc2Query [29],
+which uses a sequence-to-sequence model that maps a document to queries that
+it might be able to answer. By appending these generated queries to a docu-
+ment’s content before indexing, the document is more likely to be retrieved for
+user queries when using a model like BM25. An alternative style of document
+expansion, proposed by MacAvaney et al. [19] and since used by several other
+models (e.g., [10,39,40]), uses the built-in Masked Language Modelling (MLM)
+mechanism. MLM expansion generates individual tokens to append to the docu-
+ment as a bag of words (rather than as a sequence). Although MLM expansion is
+also prone to hallucination,2the bag-of-words nature of MLM expansion means
+that individual expansion tokens may not have suﬃcient context to apply ﬁl-
+tering eﬀectively. We therefore focus only on sequence-style expansion and leave
+the exploration of MLM expansion for future work.
+3 Doc2Query--
+Doc2Query-- consists of two phases: a generation phrase and a ﬁltering phase.
+In the generation phase, a Doc2Query model generates a set of nqueries that
+each document might be able to answer. However, as shown in Figure 1, not
+all of the queries are necessarily relevant to the document. To mitigate this
+problem, Doc2Query-- then proceeds to a ﬁltering phase, which is responsible
+for eliminating the generated queries that are least relevant to the source doc-
+ument. Because hallucinated queries contain details not present in the original
+text (by deﬁnition), we argue that hallucinated queries are less useful for re-
+trieval than non-hallucinated ones. Filtering is accomplished by retaining only
+the most relevant pproportion of generated queries over the entire corpus. The
+retained queries are then concatenated to their corresponding documents prior
+to indexing, as per the existing Doc2Query approach.
+More formally, consider an expansion function ethat maps a document to n
+queries: e:D7!Qn. In Doc2Query, each document in corpus Dare concate-
+natedwiththeirexpansionqueries,forminganewcorpus D0=fConcat (d; e(d))j
+d2Dg,whichisthen indexedbya retrievalsystem.Doc2Query--addsaﬁltering
+mechanism that uses a relevance model that maps a query and document to a
+real-valued relevance score s:QD7!R(with larger values indicating higher
+2For instance, we ﬁnd that SPLADE [10] generates the following seemingly-unrelated
+terms for the passage in Figure 1 in the top 20 expansion terms: reed,herb, and troy.4 Gospodinov et al.
+relevance). The relevance scoring function is used to ﬁlter down the queries to
+those that meet a certain score threshold tas follows:
+D0=n
+Concat 
+d;
+qjq2e(d)^s(q; d)t	
+jd2Do
+(1)
+The relevance threshold tis naturally dependent upon the relevance scoring
+function. It can be set empirically, chosen based on operational criteria (e.g.,
+targetindexsize),or(forawell-calibratedrelevancescoringfunction)determined
+a priori. In this work, we combine the ﬁrst two strategies: we pick tbased on
+the distribution of relevance scores across all expansion queries. For instance,
+atp= 0:3we only keep queries with relevance scores in the top 30%, which is
+t= 3:215for the ELECTRA [31] scoring model on the MS MARCO dataset [26].
+4 Experimental Setup
+We conduct experiments to answer the following research questions:
+RQ1 Does Doc2Query-- improve the eﬀectiveness of document expansion?
+RQ2 What are the trade-oﬀs in terms of eﬀectiveness, eﬃciency, and storage when
+using Doc2Query--?
+Datasets and Measures. We conduct tests using the MS MARCO [26] v1
+passage corpus. We use ﬁve test collections:3(1) the MS MARCO Dev (small)
+collection, consisting of 6,980 queries (1.1 qrels/query); (2) the Dev2 collection,
+consisting of 4,281 (1.1 qrels/query); (3) the MS MARCO Eval set, consisting of
+6,837 queries (held-out leaderboard set); (4/5) the TREC DL’19/’20 collections,
+consisting of 43/54 queries (215/211 qrels/query). We evaluate using the oﬃcial
+task evaluation measures: Reciprocal Rank at 10 (RR@10) for Dev/Dev2/Eval,
+nDCG@10 for DL’19/’20. We tune systems4on Dev, leaving the remaining col-
+lections as held-out test sets.
+Models. We use the T5 Doc2Query model from Nogueira and Lin [28], mak-
+ing use of the inferred queries released by the authors (80 per passage). To the
+best of our knowledge, this is the highest-performing Doc2Query model avail-
+able. We consider three neural relevance models for ﬁltering: ELECTRA5[31],
+MonoT56[32],andTCT-ColBERT7[16],coveringtwostrongcross-encodermod-
+els and one strong bi-encoder model. We also explored ﬁlters that use the prob-
+abilities from the generation process itself but found them to be ineﬀective and
+therefore omit these results due to space constraints.
+Tools and Environment. WeusethePyTerriertoolkit[22]withaPISA[24,17]
+index to conduct our experiments. We deploy PISA’s Block-Max WAND [7] im-
+plementation for BM25 retrieval. Inference was conducted on an NVIDIA 3090
+GPU. Evaluation was conducted using the ir-measures package [18].
+3ir-datasets [21] IDs: msmarco-passage/dev/small ,msmarco-passage/dev/2 ,
+msmarco-passage/eval/small , msmarco-passage/trec-dl-2019/judged ,
+msmarco-passage/trec-dl-2020/judged4BM25’s k1,b, and whether to
+remove stopwords were tuned for all systems; the ﬁltering percentage ( p)
+was also tuned for ﬁltered systems.5crystina-z/monoELECTRA_LCE_nneg31
+6castorini/monot5-base-msmarco7castorini/tct_colbert-v2-hnp-msmarcoDoc2Query--: When Less is More 5
+Table 1. Eﬀectiveness and eﬃciency measurements for Doc2Query-- and baselines.
+Signiﬁcant diﬀerences between Doc2Query and their corresponding ﬁltered versions
+for Dev, Dev2, DL’19 and DL’20 are indicated with * (paired t-test, p < 0:05). Values
+marked withyare taken from the corresponding submissions to the public leaderboard.
+RR@10 nDCG@10 ms/q GB
+System Dev Dev2 Eval DL’19 DL’20 MRT Index
+BM25 0.185 0.182y0.186 0.499 0.479 5 0.71
+Doc2Query ( n= 40) 0.277 0.265y0.272 0.626 0.607 30 1.17
+w/ ELECTRA Filter (30%) *0.316 *0.310 -0.667 0.611 23 0.89
+w/ MonoT5 Filter (40%) *0.308 *0.298 0.306 0.650 0.611 29 0.93
+w/ TCT Filter (50%) *0.287 *0.280 - 0.640 0.599 30 0.94
+Doc2Query ( n= 80) 0.279 0.267 - 0.627 0.605 30 1.41
+w/ ELECTRA Filter (30%) *0.323 *0.316 0.325 0.670 0.614 23 0.95
+w/ MonoT5 Filter (40%) *0.311 *0.298 - 0.665 0.609 28 1.04
+w/ TCT Filter (50%) *0.293 *0.283 - 0.642 0.588 28 1.05
+5 Results
+We ﬁrst explore RQ1: whether relevance ﬁltering can improve the retrieval of
+Doc2Query models. Table 1 compares the eﬀectiveness of Doc2Query with var-
+ious ﬁlters. We observe that all the ﬁlters signiﬁcantly improve the retrieval
+eﬀectiveness on the Dev and Dev2 datasets at both n= 40andn= 80. We also
+observe a large boost in performance on the Eval dataset.8Though the diﬀer-
+ences in DL’19 and DL’20 appear to be considerable (e.g., 0.627 to 0.670), these
+diﬀerences are not statistically signiﬁcant.
+Diggingalittledeeper,Figure2showstheretrievaleﬀectivenessofDoc2Query
+with various numbers of generated queries (in dotted black) and the correspond-
+ing performance when ﬁltering using the top-performing ELECTRA scorer (in
+solid blue). We observe that performing relevance ﬁltering at each value of n
+improves the retrieval eﬀectiveness. For instance, keeping only 30% of expan-
+sion queries at n= 80, performance is increased from 0.279 to 0.323 – a 16%
+improvement.
+In aggregate, results from Table 1 and Figure 2 answer RQ1: Doc2Query--
+ﬁltering can signiﬁcantly improve the retrieval eﬀectiveness of Doc2Query across
+various scoring models, numbers of generated queries ( n) and thresholds ( p).
+Next,weexplorethetrade-oﬀsintermsofeﬀectiveness,eﬃciency,andstorage
+when using Doc2Query--. Table 1 includes the mean response time and index
+sizes for each of the settings. As expected, ﬁltering reduces the index size since
+fewer terms are stored. For the best-performing setting ( n= 80with ELECTRA
+8Signiﬁcance cannot be determined due to the held-out nature of the dataset. Further,
+due to restrictions on the number of submissions to the leaderboard, we only are able
+to submit two runs. The ﬁrst aims to be a fair comparison with the existing Doc2Query
+Eval result, using the same number of generated queries and same base T5 model for
+scoring. The second is our overall best-performing setting, using the ELECTRA ﬁlter
+atn= 80generated queries.6 Gospodinov et al.
+0 1 2 3 4 5
+Total Tokens 1e90.2250.2500.2750.3000.325RR@10
+90%80%70%60%50%40% 30%
+n=5n=10n=20n=40 n=80
+Generation PhaseFiltering Phase
+Fig. 2.Eﬀectiveness (RR@10) on the Dev set, compared with the total number of
+indexed tokens. The generation phase is shown in dotted black (at various values of
+n), and the ELECTRA ﬁltering phase is shown in solid blue (at various values of p).
+ﬁlter), this amounts to a 33% reduction in index size (1.41 GB down to 0.95 GB).
+Naturally, such a reduction has an impact on query processing time as well; it
+yields a 23% reduction in mean response time (30ms down to 23ms).
+Doc2Query-- ﬁltering adds substantial cost an indexing time, mostly due to
+scoring each of the generated queries. Table 2 reports the cost (in hours of GPU
+time) of the generation and ﬁltering phases. We observe that ELECTRA ﬁlter-
+ing can yield up to a 78% increase in GPU time ( n= 10). However, we ﬁnd that
+the improved eﬀectiveness makes up for this cost. To demonstrate this, we al-
+locate the time spent ﬁltering to generating additional queries for each passage.
+For instance, the 15 hours spent scoring n= 5queries could instead be spent
+generating 6 more queries per passage (for a total of n= 11). We ﬁnd that when
+comparing against an unﬁltered nthat closely approximates the total time when
+Table 2. Retrieval eﬀectiveness comparison for comparable indexing computational
+budgets (in hours of GPU time). Values of nwithout a ﬁlter are chosen to best approx-
+imate the total compute hours or the Dev eﬀectiveness of the corresponding ﬁltered
+version. Signiﬁcant diﬀerences between in RR@10 performance are indicated with *
+(paired t-test, p < 0:05).
+GPU Hours RR@10
+nFilter Gen+Filt=Tot Dev Dev2 Comment
+5 ELECTRA 20 + 15 = 34 0.273 0.270
+11None 34 + 0 = 34 *0.261 *0.256  4% Dev RR for sim. GPU hrs
+31None 99 + 0 = 99 0.273 0.2652:9GPU hrs to match Dev RR
+10 ELECTRA 32 + 25 = 57 0.292 0.292
+18None 59 + 0 = 59 *0.270 *0.260  8% Dev RR for sim. GPU hrs
+20 ELECTRA 66 + 47 = 113 0.307 0.303
+36None 113 + 0 = 113 *0.275 *0.265  10% Dev RR for sim. GPU hrs
+40 ELECTRA 128 + 86 = 214 0.316 0.310
+68None 216 + 0 = 216 *0.279 *0.267  12% Dev RR for sim. GPU hrsDoc2Query--: When Less is More 7
+ﬁltering, the ﬁltered results consistently yield signiﬁcantly higher retrieval eﬀec-
+tiveness. As the computational budget increases, so does the margin between
+Doc2Query and Doc2Query--, from 4% at 34 hours up to 12% at 216 hours.
+From the opposite perspective, Doc2Query consumes 2.9 or more GPU
+time than Doc2Query-- to achieve similar eﬀectiveness ( n= 13with no ﬁlter
+vs.n= 5with ELECTRA ﬁlter). Since the eﬀectiveness of Doc2Query ﬂattens
+out between n= 40andn= 80(as seen in Figure 2), it likely requires a
+massive amount of additional compute to reach the eﬀectiveness of Doc2Query--
+atn10, if that eﬀectiveness is achievable at all. These comparisons show that
+if a deployment is targeting a certain level of eﬀectiveness (rather than a target
+compute budget), Doc2Query-- is also preferable to Doc2Query.
+TheseresultscollectivelyanswerRQ2:Doc2Query--provideshighereﬀective-
+ness at lower query-time costs, even when controlling for the additional compute
+required at index time.
+6 Conclusions
+Thisworkdemonstratedthatthereareuntappedadvantagesingeneratingnatural-
+language for document expansion. Speciﬁcally, we presented Doc2Query--, which
+isanewapproachforimprovingtheeﬀectivenessandeﬃciencyoftheDoc2Query
+model by ﬁltering out the least relevant queries. We observed that a 16% im-
+provement in retrieval eﬀectiveness can be achieved, while reducing the index
+size by 33% and mean query execution time by 23%.
+The technique of ﬁltering text generated from language models using rel-
+evance scoring is ripe for future work. For instance, relevance ﬁltering could
+potentially apply to approaches that generate alternative forms of queries [38],
+training data [2], or natural language responses to queries [5] — all of which
+are potentially aﬀected by hallucinated content. Furthermore, future work could
+explore approaches for relevance ﬁltering over masked language modelling ex-
+pansion [19], rather than sequence-to-sequence expansion.
+Acknowledgements
+SeanMacAvaneyandCraigMacdonaldacknowledgeEPSRCgrantEP/R018634/1:
+Closed-Loop Data Science for Complex, Computationally- & Data-Intensive An-
+alytics.
+References
+1. Amati, G., Van Rijsbergen, C.J.: Probabilistic models of information retrieval
+based on measuring the divergence from randomness. ACM Trans. Inf. Syst. 20(4)
+(2002)
+2. Bonifacio,L.,Abonizio,H.,Fadaee,M.,Nogueira,R.:InPars:Unsuperviseddataset
+generation for information retrieval. In: Proceedings of SIGIR (2022)8 Gospodinov et al.
+3. Dai, Z., Callan, J.: Deeper text understanding for IR with contextual neural lan-
+guage modeling. In: Proceedings of SIGIR (2019)
+4. Dai, Z., Callan, J.: Context-aware document term weighting for ad-hoc search. In:
+Proceedings of The Web Conference (2020)
+5. Das, R., Dhuliawala, S., Zaheer, M., McCallum, A.: Multi-step retriever-reader
+interaction for scalable open-domain question answering. In: Proceedings of ICLR
+(2019)
+6. Devlin, J., Chang, M.W., Lee, K., Toutanova, K.: BERT: Pre-training of deep
+bidirectional transformers for language understanding. In: Proceedings of NAACL-
+HLT (2019)
+7. Ding, S., Suel, T.: Faster top-k document retrieval using block-max indexes. In:
+Proceedings of SIGIR (2011)
+8. Dumais, S.T., Furnas, G.W., Landauer, T.K., Deerwester, S., Harshman, R.: Using
+latent semantic analysis to improve access to textual information. In: Proceedings
+of SIGCHI CHI (1988)
+9. Efron, M., Organisciak, P., Fenlon, K.: Improving retrieval of short texts through
+document expansion. In: Proceedings of SIGIR (2012)
+10. Formal, T., Piwowarski, B., Clinchant, S.: SPLADE: Sparse lexical and expansion
+model for ﬁrst stage ranking. In: Proceedings of SIGIR (2021)
+11. He, B., Ounis, I.: Studying query expansion eﬀectiveness. In: Proceedings of ECIR
+(2009)
+12. Jaleel, N.A., Allan, J., Croft, W.B., Diaz, F., Larkey, L.S., Li, X., Smucker, M.D.,
+Wade, C.: Umass at TREC 2004: Novelty and HARD. In: TREC (2004)
+13. Johnson, J., Douze, M., Jegou, H.: Billion-scale similarity search with GPUs. IEEE
+Transactions on Big Data 7(03) (2021)
+14. Khattab, O., Zaharia, M.: ColBERT: Eﬃcient and eﬀective passage search via
+contextualized late interaction over BERT. In: Proceedings of SIGIR (2020)
+15. Lin, J., Ma, X., Mackenzie, J., Mallia, A.: On the separation of logical and physical
+ranking models for text retrieval applications. In: Proceedings of DESIRES (2021)
+16. Lin, S.C., Yang, J.H., Lin, J.: In-batch negatives for knowledge distillation with
+tightly-coupled teachers for dense retrieval. In: Proceedings of RepL4NLP (2021)
+17. MacAvaney, S., Macdonald, C.: A Python interface to PISA! In: Proceedings of
+SIGIR (2022)
+18. MacAvaney,S.,Macdonald,C.,Ounis,I.:Streamliningevaluationwithir-measures.
+In: Proceedings of ECIR (2022)
+19. MacAvaney, S., Nardini, F.M., Perego, R., Tonellotto, N., Goharian, N., Frieder,
+O.: Expansion via prediction of importance with contextualization. In: Proceedings
+of SIGIR (2020)
+20. MacAvaney, S., Tonellotto, N., Macdonald, C.: Adaptive re-ranking with a corpus
+graph. In: Proceedings of CIKM (2022)
+21. MacAvaney, S., Yates, A., Feldman, S., Downey, D., Cohan, A., Goharian, N.:
+Simpliﬁed data wrangling with ir_datasets. In: Proceedings of SIGIR (2021)
+22. Macdonald, C., Tonellotto, N.: Declarative experimentation in information re-
+trieval using PyTerrier. In: Proceedings of ICTIR (2020)
+23. Mallia, A., Khattab, O., Suel, T., Tonellotto, N.: Learning passage impacts for
+inverted indexes. In: Proceedings of SIGIR (2021)
+24. Mallia, A., Siedlaczek, M., Mackenzie, J., Suel, T.: PISA: performant indexes and
+search for academia. In: Proceedings of OSIRRC@SIGIR (2019)
+25. Maynez, J., Narayan, S., Bohnet, B., McDonald, R.: On faithfulness and factuality
+in abstractive summarization. In: Proceedings of ACL (2020)Doc2Query--: When Less is More 9
+26. Nguyen, T., Rosenberg, M., Song, X., Gao, J., Tiwary, S., Majumder, R., Deng,
+L.: MS MARCO: A human generated machine reading comprehension dataset. In:
+Proceedings of CoCo@NIPS (2016)
+27. Nogueira, R., Cho, K.: Passage re-ranking with BERT. ArXiv abs/1901.04085
+(2019)
+28. Nogueira, R., Lin, J.: From doc2query to doctttttquery (2019)
+29. Nogueira, R., Yang, W., Lin, J.J., Cho, K.: Document expansion by query predic-
+tion. ArXiv abs/1904.08375 (2019)
+30. Pickens, J., Cooper, M., Golovchinsky, G.: Reverted indexing for feedback and
+expansion. In: Proceedings of CIKM (2010)
+31. Pradeep, R., Liu, Y., Zhang, X., Li, Y., Yates, A., Lin, J.: Squeezing water from a
+stone: A bag of tricks for further improving cross-encoder eﬀectiveness for rerank-
+ing. In: Proceedings of ECIR (2022)
+32. Pradeep, R., Nogueira, R., Lin, J.: The expando-mono-duo design pattern for text
+ranking with pretrained sequence-to-sequence models. ArXiv abs/2101.05667
+(2021)
+33. Raﬀel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M., Zhou, Y.,
+Li, W., Liu, P.J., et al.: Exploring the limits of transfer learning with a uniﬁed
+text-to-text transformer. J. Mach. Learn. Res. 21(140) (2020)
+34. Scells, H., Zhuang, S., Zuccon, G.: Reduce, reuse, recycle: Green information re-
+trieval research. In: Proceedings of SIGIR (2022)
+35. Tao, T., Wang, X., Mei, Q., Zhai, C.: Language model information retrieval with
+document expansion. In: Proceedings of HLT-NAACL (2006)
+36. Wang, X., MacAvaney, S., Macdonald, C., Ounis, I.: An inspection of the repro-
+ducibility and replicability of TCT-ColBERT. In: Proceedings of SIGIR (2022)
+37. Xiong, L., Xiong, C., Li, Y., Tang, K.F., Liu, J., Bennett, P.N., Ahmed, J., Over-
+wijk,A.:Approximatenearestneighbornegativecontrastivelearningfordensetext
+retrieval. In: Proceedings of ICLR (2021)
+38. Yu, S.Y., Liu, J., Yang, J., Xiong, C., Bennett, P.N., Gao, J., Liu, Z.: Few-shot
+generative conversational query rewriting. In: Proceedings of SIGIR (2020)
+39. Zhao, T., Lu, X., Lee, K.: SPARTA: Eﬃcient open-domain question answering via
+sparse transformer matching retrieval. arXiv abs/2009.13013 (2020)
+40. Zhuang, S., Zuccon, G.: TILDE: Term independent likelihood model for passage
+re-ranking. In: Proceedings of SIGIR (2021)"
+4,5,https://arxiv.org/pdf/2303.07678.pdf,"Query2doc: Query Expansion with Large Language Models
+Liang Wang and Nan Yang and Furu Wei
+Microsoft Research
+{wangliang,nanya,fuwei}@microsoft.com
+Abstract
+This paper introduces a simple yet effec-
+tive query expansion approach, denoted as
+query2doc , to improve both sparse and dense
+retrieval systems. The proposed method
+ﬁrst generates pseudo-documents by few-shot
+prompting large language models (LLMs), and
+then expands the query with generated pseudo-
+documents. LLMs are trained on web-scale
+text corpora and are adept at knowledge mem-
+orization. The pseudo-documents from LLMs
+often contain highly relevant information that
+can aid in query disambiguation and guide
+the retrievers. Experimental results demon-
+strate that query2doc boosts the performance
+of BM25 by 3% to 15% on ad-hoc IR datasets,
+such as MS-MARCO and TREC DL, with-
+out any model ﬁne-tuning. Furthermore, our
+method also beneﬁts state-of-the-art dense re-
+trievers in terms of both in-domain and out-of-
+domain results.
+1 Introduction
+Information retrieval (IR) aims to locate relevant
+documents from a large corpus given a user is-
+sued query. It is a core component in modern
+search engines and researchers have invested for
+decades in this ﬁeld. There are two mainstream
+paradigms for IR: lexical-based sparse retrieval,
+such as BM25, and embedding-based dense re-
+trieval (Xiong et al., 2021; Qu et al., 2021). Al-
+though dense retrievers perform better when large
+amounts of labeled data are available (Karpukhin
+et al., 2020), BM25 remains competitive on out-of-
+domain datasets (Thakur et al., 2021).
+Query expansion (Rocchio, 1971; Lavrenko
+and Croft, 2001) is a long-standing technique
+that rewrites the query based on pseudo-relevance
+feedback or external knowledge sources such as
+WordNet. For sparse retrieval, it can help bridge
+the lexical gap between the query and the docu-
+ments. However, query expansion methods like
+RM3 (Lavrenko and Croft, 2001; Lv and Zhai,2009) have only shown limited success on popular
+datasets (Campos et al., 2016), and most state-of-
+the-art dense retrievers do not adopt this technique.
+In the meantime, document expansion methods like
+doc2query (Nogueira et al., 2019) have proven to
+be effective for sparse retrieval.
+In this paper, we demonstrate the effectiveness
+of LLMs (Brown et al., 2020) as query expan-
+sion models by generating pseudo-documents con-
+ditioned on few-shot prompts. Given that search
+queries are often short, ambiguous, or lack neces-
+sary background information, LLMs can provide
+relevant information to guide retrieval systems, as
+they memorize an enormous amount of knowledge
+and language patterns by pre-training on trillions
+of tokens.
+Our proposed method, called query2doc , gen-
+erates pseudo-documents by few-shot prompting
+LLMs and concatenates them with the original
+query to form a new query. This method is simple
+to implement and does not require any changes in
+training pipelines or model architectures, making it
+orthogonal to the progress in the ﬁeld of LLMs and
+information retrieval. Future methods can easily
+build upon our query expansion framework.
+For in-domain evaluation, we adopt the MS-
+MARCO passage ranking (Campos et al., 2016),
+TREC DL 2019 and 2020 datasets. Pseudo-
+documents are generated by prompting an im-
+proved version of GPT-3 text-davinci-003 from
+OpenAI (Brown et al., 2020). Results show that
+query2doc substantially improves the off-the-shelf
+BM25 algorithm without ﬁne-tuning any model,
+particularly for hard queries from the TREC DL
+track. Strong dense retrievers, including DPR
+(Karpukhin et al., 2020), SimLM (Wang et al.,
+2022a), and E5 (Wang et al., 2022b) also bene-
+ﬁt from query2doc , although the gains tend to be
+diminishing when distilling from a strong cross-
+encoder based re-ranker. Experiments in zero-shot
+OOD settings demonstrate that our method out-arXiv:2303.07678v1  [cs.IR]  14 Mar 2023performs strong baselines on most datasets. Fur-
+ther analysis also reveals the importance of model
+scales: query2doc works best when combined with
+the most capable LLMs while small language mod-
+els only provide marginal improvements over base-
+lines.
+To aid reproduction, we release all
+the generations from text-davinci-003
+at https://huggingface.co/datasets/
+intfloat/query2doc_msmarco .
+2 Method
+Write a passage that answers the given query:
+Query: what state is this zip code 85282
+Passage: Welcome to TEMPE, AZ 85282. 
+85282 is a rural zip code in Tempe, Arizona. 
+The population is primarily white…
+…
+Query: when was pokemon green released
+Passage:LLM Prompts
+Pokemon Green was released in Japan on 
+February 27th, 1996. It was the first in the 
+Pokemon series of games and served as the 
+basis for Pokemon Red and Blue, which were 
+released in the US in 1998. The original 
+Pokemon Green remains a beloved classic 
+among fans of the series.LLM Output
+Figure 1: Illustration of query2doc few-shot prompting.
+We omit some in-context examples for space reasons.
+Given a query q, we employ few-shot prompting
+to generate a pseudo-document d0as depicted in
+Figure 1. The prompt comprises a brief instruction
+“Write a passage that answers the given query:”
+andklabeled pairs randomly sampled from a
+training set. We use k= 4throughout this paper.
+Subsequently, we rewrite qto a new query q+
+by concatenating with the pseudo-document d0.
+There are slight differences in the concatenation
+operation for sparse and dense retrievers, which
+we elaborate on in the following section.
+Sparse Retrieval Since the query qis typically
+much shorter than pseudo-documents, we boost the
+query term weights by repeating the query ntimes
+before concatenating with the pseudo-document d0:q+=concat(fqgn; d0) (1)
+Here, “concat” denotes the string concatenation
+function. q+is used as the new query for
+BM25 retrieval. We ﬁnd that n= 5 is a gener-
+ally good value and do not tune it on a dataset basis.
+Dense Retrieval The new query q+is a sim-
+ple concatenation of the original query qand the
+pseudo-document d0separated by [SEP]:
+q+=concat(q;[SEP]; d0) (2)
+For training dense retrievers, several factors can
+inﬂuence the ﬁnal performance, such as hard nega-
+tive mining (Xiong et al., 2021), intermediate pre-
+training (Gao and Callan, 2021), and knowledge
+distillation from a cross-encoder based re-ranker
+(Qu et al., 2021). In this paper, we investigate two
+settings to gain a more comprehensive understand-
+ing of our method. The ﬁrst setting is training DPR
+(Karpukhin et al., 2020) models initialized from
+BERT basewith BM25 hard negatives only. The op-
+timization objective is a standard contrastive loss:
+Lcont= logehqhd
+ehqhd+P
+di2Nehqhdi(3)
+where hqandhdrepresent the embeddings for the
+query and document, respectively. Ndenotes the
+set of hard negatives.
+The second setting is to build upon state-of-the-
+art dense retrievers and use KL divergence to distill
+from a cross-encoder teacher model.
+minDKL(pce;pstu) +Lcont (4)
+pceandpstuare the probabilities from the cross-
+encoder and our student model, respectively. is
+a coefﬁcient to balance the distillation loss and
+contrastive loss.
+Comparison with Pseudo-relevance Feedback
+Our proposed method can be viewed as a variant
+of pseudo-relevance feedback (PRF) (Lavrenko
+and Croft, 2001; Lv and Zhai, 2009). In conven-
+tional PRF, the feedback signals for query expan-
+sion come from the top-k documents obtained in
+the initial retrieval step, while our method prompts
+LLMs to generate pseudo-documents. Our method
+does not rely on the quality of the initial retrieval re-
+sults, which are often noisy or irrelevant. Rather, it
+exploits cutting-edge LLMs to generate documents
+that are more likely to contain relevant terms.Method Fine-tuningMS MARCO dev TREC DL 19 TREC DL 20
+MRR@10 R@50 R@1k nDCG@10 nDCG@10
+Sparse retrieval
+BM25 7 18.4 58.5 85.7 51.247.7
++ query2doc 7 21.4+3.065.3+6.891.8+6.166.2+15.062.9+15.2
+BM25 + RM3 7 15.8 56.7 86.4 52.2 47.4
+docT5query (Nogueira and Lin) 3 27.7 75.6 94.7 64.2 -
+Dense retrieval w/o distillation
+ANCE (Xiong et al., 2021) 3 33.0 - 95.9 64.5 64.6
+HyDE (Gao et al., 2022) 7 - - - 61.3 57.9
+DPR bert-base (our impl.) 3 33.7 80.5 95.9 64.7 64.1
++ query2doc 3 35.1+1.482.6+2.197.2+1.368.7+4.067.1+3.0
+Dense retrieval w/ distillation
+RocketQAv2 (Ren et al., 2021) 3 38.8 86.2 98.1 - -
+AR2 (Zhang et al., 2021) 3 39.5 87.8 98.6 - -
+SimLM (Wang et al., 2022a) 3 41.1 87.8 98.7 71.4 69.7
++ query2doc 3 41.5+0.488.0+0.298.8+0.172.9+1.571.6+1.9
+E5base+ KD (Wang et al., 2022b) 3 40.7 87.6 98.6 74.3 70.7
++ query2doc 3 41.5+0.888.1+0.598.7+0.174.9+0.672.5+1.8
+Table 1: Main results on the MS-MARCO passage ranking and TREC datasets. The “Fine-tuning” column indi-
+cates whether the method requires ﬁne-tuning model on labeled data or not. : our reproduction.
+3 Experiments
+3.1 Setup
+Evaluation Datasets For in-domain evaluation,
+we utilize the MS-MARCO passage ranking (Cam-
+pos et al., 2016), TREC DL 2019 (Craswell et al.,
+2020a) and 2020 (Craswell et al., 2020b) datasets.
+For zero-shot out-of-domain evaluation, we select
+ﬁve low-resource datasets from the BEIR bench-
+mark (Thakur et al., 2021). The evaluation met-
+rics include MRR@10, R@k ( k2f50;1kg), and
+nDCG@10.
+Hyperparameters For sparse retrieval including
+BM25 and RM3, we adopt the default implementa-
+tion from Pyserini (Lin et al., 2021). When training
+dense retrievers, we use mostly the same hyper-
+parameters as SimLM (Wang et al., 2022a), with
+the exception of increasing the maximum query
+length to 144to include pseudo-documents. When
+prompting LLMs, we include 4in-context exam-
+ples and use the default temperature of 1to sample
+at most 128tokens. For further details, please refer
+to Appendix A.
+3.2 Main Results
+In Table 1, we list the results on the MS-MARCO
+passage ranking and TREC DL datasets. For sparse
+retrieval, “BM25 + query2doc” beats the BM25
+baseline with over 15%improvements on TREC
+DL 2019 and 2020 datasets. Our manual inspection
+reveals that most queries from the TREC DL trackare long-tailed entity-centric queries, which beneﬁt
+more from the exact lexical match. The traditional
+query expansion method RM3 only marginally
+improves the R@1k metric. Although the docu-
+ment expansion method docT5query achieves bet-
+ter numbers on the MS-MARCO dev set, it requires
+training a T5-based query generator with all the
+available labeled data, while “BM25 + query2doc”
+does not require any model ﬁne-tuning.
+For dense retrieval, the model variants that com-
+bine with query2doc also outperform the corre-
+sponding baselines on all metrics. However, the
+gain brought by query2doc tends to diminish when
+using intermediate pre-training or knowledge distil-
+lation from cross-encoder re-rankers, as shown by
+the “SimLM + query2doc” and “E5 + query2doc”
+results.
+For zero-shot out-of-domain retrieval, the results
+are mixed as shown in Table 2. Entity-centric
+datasets like DBpedia see the largest improvements.
+On the NFCorpus and Scifact datasets, we observe
+a minor decrease in ranking quality. This is likely
+due to the distribution mismatch between training
+and evaluation.
+4 Analysis
+Scaling up LLMs is Critical For our proposed
+method, a question that naturally arises is: how
+does the model scale affect the quality of query
+expansion? Table 3 shows that the performance
+steadily improves as we go from the 1.3B modelDBpedia NFCorpus Scifact Trec-Covid Touche2020
+BM25 31.3 32.5 66.5 65.6 36.7
++ query2doc 37.0+5.734.9+2.468.6+2.172.2+6.639.8+3.1
+SimLM (Wang et al., 2022a) 34.9 32.7 62.4 55.0 18.9
++ query2doc 38.3+3.432.1-0.659.5-2.959.9+4.925.6+6.7
+E5base+ KD (Wang et al., 2022b) 40.7 35.0 70.4 74.1 30.9
++ query2doc 42.4+1.735.2+0.267.5-2.975.1+1.031.7+0.8
+Table 2: Zero-shot out-of-domain results on 5 low-resource datasets from the BEIR benchmark (Thakur et al.,
+2021). The reported numbers are nDCG@10. For a fair comparison, the in-context examples for prompting LLMs
+come from the MS-MARCO training set.
+# params TREC 19 TREC 20
+BM25 - 51.2 47.7
+w/ babbage 1.3B 52.0 50.2
+w/ curie 6.7B 55.1 50.1
+w/ davinci-001 175B 63.5 58.2
+w/ davinci-003 175B 66.2 62.9
+Table 3: Query expansion with different model sizes.
+to 175B models. Empirically, the texts generated
+by smaller language models tend to be shorter and
+contain more factual errors. Also, the “davinci-003”
+model outperforms its earlier version “davinci-001”
+by using better training data and improved
+instruction tuning.
+1 10 30 50 100
+% labeled data for fine-tuning202224262830323436MRR on dev set
+21.427.331.432.833.7
+22.728.532.134.135.1
+DPR w/o query2doc
+DPR w/ query2doc
+Figure 2: MRR on MS-MARCO dev set w.r.t the per-
+centage of labeled data used for ﬁne-tuning.
+Performance Gains are Consistent across Data
+Scales Figure 2 presents a comparison between
+two variants of DPR models, which differ in the
+amount of labeled data used. The results show
+that the “DPR + query2doc” variant consistently
+outperforms the DPR baseline by approximately
+1%, regardless of the amount of data used for
+ﬁne-tuning. This observation highlights that ourcontribution is orthogonal to the continual scaling
+up of supervision signals.
+TREC 19 TREC 20
+BM25 + query2doc 66.2 62.9
+w/ query only 51.2 47.7
+w/ pseudo-doc only 48.7 44.5
+Table 4: Using the concatenation of the original query
+and the generated pseudo-documents perform substan-
+tially better.
+How to Use Pseudo-documents In this paper,
+we concatenate the original query and pseudo-
+documents as the new query. Alternatively, one can
+solely use the pseudo-documents, as done in the
+approach of HyDE (Gao et al., 2022). The results
+presented in Table 4 demonstrate that the original
+query and pseudo-documents are complementary,
+and their combination leads to substantially better
+performance in sparse retrieval.
+Case Analysis In Table 5, we show two queries
+along with their respective pseudo-documents and
+groundtruth. The pseudo-documents, which are
+generated by LLMs, offer detailed and mostly ac-
+curate information, thereby reducing the lexical
+mismatch between the query and documents. In
+some cases, the pseudo-documents are sufﬁcient to
+meet the user’s information needs, rendering the
+retrieval step unnecessary. However, it is worth
+noting that the LLM generations may contain fac-
+tual errors. For instance, in the second query, the
+theme song ""It’s a Jungle Out There"" was used as
+of season two in 2003, not 20021. Although such
+errors may appear subtle and difﬁcult to verify, they
+pose a signiﬁcant challenge to building trustworthy
+systems using LLMs.
+1Refer to https://en.wikipedia.org/wiki/It’s_a_
+Jungle_Out_There_(song)query who killed nicholas ii of russia
+LLM generation Nicholas II of Russia, the last Tsar of Russia, was executed by Bolshevik revolutionaries on
+July 17th, 1918 , along with his wife Alexandra and their ﬁve children . The execution was
+ordered by Vladimir Lenin , the leader of the Bolshevik Party. The actual execution was carried
+out by a ﬁring squad of Bolshevik troops, and the bodies were later buried in a mass grave. . .
+Groundtruth (1868- 1918 ). Nicholas II was the lastemperor, or tsar, of Russia, serving from 1894 to
+1917. Nicholas, his wife, and their ﬁve children were killed by the Bolsheviks , members of a
+revolutionary group (led by Lenin ) who seized control of the government in Russia during
+the October Revolution (see Russian Revolution) of 1917.
+query who sings monk theme song
+LLM generation The theme song for the television show Monk is entitled "" It’s a Jungle Out There "" and is
+sung by American singer-songwriter Randy Newman . The song was written speciﬁcally for
+the show, and it has been used as the theme song since the series premiered in 2002 . It has
+been praised by critics and fans alike and is often regarded as one of the best theme songs in
+television history.
+Groundtruth exists and is an alternate of. The Monk theme song is It’s a Jungle Out There byRandy
+Newman . The Monk theme song is It’s a Jungle Out There byRandy Newman .
+Table 5: Examples from the TREC DL 2020 dataset. Bold texts are the overlapping words between groundtruth
+and pseudo-documents generated from LLMs. The italicized red sentence demonstrates a factual error in language
+model generations.
+5 Related Work
+Query Expansion and Document Expansion
+are two classical techniques to improve retrieval
+quality, particularly for sparse retrieval systems.
+Both techniques aim to minimize the lexical gap be-
+tween the query and the documents. Query expan-
+sion typically involves rewriting the query based
+on relevance feedback (Lavrenko and Croft, 2001;
+Rocchio, 1971) or lexical resources such as Word-
+Net (Miller, 1992). In cases where labeled rele-
+vance feedback is not available, the top-k retrieved
+documents can serve as pseudo-relevance feedback
+signals (Lv and Zhai, 2009).
+In contrast, document expansion enriches the
+document representation by appending additional
+relevant terms. Doc2query (Nogueira et al., 2019)
+trains a seq2seq model to predict pseudo-queries
+based on documents and then adds generated
+pseudo-queries to the document index. Learned
+sparse retrieval models such as SPLADE (Formal
+et al., 2021) and uniCOIL (Lin and Ma, 2021)
+also learn document term weighting in an end-to-
+end fashion. However, most state-of-the-art dense
+retrievers (Ren et al., 2021; Wang et al., 2022a)
+do not adopt any expansion techniques. Our pa-
+per demonstrates that strong dense retrievers also
+beneﬁt from query expansion using LLMs.
+Large Language Models (LLMs) such as GPT-3
+(Brown et al., 2020), PaLM (Chowdhery et al.,
+2022), and LLaMA (Touvron et al., 2023) are
+trained on trillions of tokens with billions of param-
+eters, exhibiting unparalleled generalization abilityacross various tasks. LLMs can follow instruc-
+tions in a zero-shot manner or conduct in-context
+learning through few-shot prompting. Labeling a
+few high-quality examples only requires minimal
+human effort. In this paper, we employ few-shot
+prompting to generate pseudo-documents from a
+given query. A closely related recent work HyDE
+(Gao et al., 2022) instead focuses on the zero-
+shot setting and uses embeddings of the pseudo-
+documents for similarity search. HyDE implicitly
+assumes that the groundtruth document and pseudo-
+documents express the same semantics in different
+words, which may not hold for some queries. In the
+ﬁeld of question answering, RECITE (Sun et al.,
+2022) and GENREAD (Yu et al., 2022) demon-
+strate that LLMs are powerful context generators
+and can encode abundant factual knowledge. How-
+ever, as our analysis shows, LLMs can sometimes
+generate false claims, hindering their practical ap-
+plication in critical areas.
+6 Conclusion
+This paper presents a simple method query2doc
+to leverage LLMs for query expansion. It ﬁrst
+prompts LLMs with few-shot examples to gener-
+ate pseudo-documents and then integrates with ex-
+isting sparse or dense retrievers by augmenting
+queries with generated pseudo-documents. The un-
+derlying motivation is to distill the LLMs through
+prompting. Despite its simplicity, empirical evalua-
+tions demonstrate consistent improvements across
+various retrieval models and datasets.Limitations
+LLM call Index search
+BM25 - 16ms
++ query2doc >2000ms 177ms
+Table 6: Latency analysis for retrieval systems with our
+proposed query2doc. We retrieve the top 100 results for
+MS-MARCO dev queries with a single thread and then
+average over all the queries. The latency for LLM API
+calls depends on server load and is difﬁcult to precisely
+measure.
+An apparent limitation is the efﬁciency of re-
+trieval. Our method requires running inference with
+LLMs which can be considerably slower due to the
+token-by-token autoregressive decoding. Moreover,
+with query2doc, searching the inverted index also
+becomes slower as the number of query terms in-
+creases after expansion. This is supported by the
+benchmarking results in Table 6. Real-world de-
+ployment of our method should take these factors
+into consideration.
+References
+Alexander Bondarenko, Maik Fröbe, Johannes Kiesel,
+Shahbaz Syed, Timon Gurcke, Meriem Beloucif,
+Alexander Panchenko, Chris Biemann, Benno Stein,
+Henning Wachsmuth, et al. 2022. Overview of
+touché 2022: argument retrieval. In Interna-
+tional Conference of the Cross-Language Evalua-
+tion Forum for European Languages , pages 311–
+336. Springer.
+Vera Boteva, Demian Gholipour, Artem Sokolov, and
+Stefan Riezler. 2016. A full-text learning to rank
+dataset for medical information retrieval. In Euro-
+pean Conference on Information Retrieval , pages
+716–722. Springer.
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie
+Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind
+Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+Askell, Sandhini Agarwal, Ariel Herbert-V oss,
+Gretchen Krueger, Tom Henighan, Rewon Child,
+Aditya Ramesh, Daniel M. Ziegler, Jeffrey Wu,
+Clemens Winter, Christopher Hesse, Mark Chen,
+Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin
+Chess, Jack Clark, Christopher Berner, Sam Mc-
+Candlish, Alec Radford, Ilya Sutskever, and Dario
+Amodei. 2020. Language models are few-shot learn-
+ers. In Advances in Neural Information Processing
+Systems 33: Annual Conference on Neural Informa-
+tion Processing Systems 2020, NeurIPS 2020, De-
+cember 6-12, 2020, virtual .
+Daniel Fernando Campos, Tri Nguyen, Mir Rosenberg,
+Xia Song, Jianfeng Gao, Saurabh Tiwary, RanganMajumder, Li Deng, and Bhaskar Mitra. 2016. Ms
+marco: A human generated machine reading com-
+prehension dataset. ArXiv , abs/1611.09268.
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin,
+Maarten Bosma, Gaurav Mishra, Adam Roberts,
+Paul Barham, Hyung Won Chung, Charles Sutton,
+Sebastian Gehrmann, Parker Schuh, Kensen Shi,
+Sasha Tsvyashchenko, Joshua Maynez, Abhishek
+Rao, Parker Barnes, Yi Tay, Noam M. Shazeer, Vin-
+odkumar Prabhakaran, Emily Reif, Nan Du, Ben-
+ton C. Hutchinson, Reiner Pope, James Bradbury, Ja-
+cob Austin, Michael Isard, Guy Gur-Ari, Pengcheng
+Yin, Toju Duke, Anselm Levskaya, Sanjay Ghe-
+mawat, Sunipa Dev, Henryk Michalewski, Xavier
+García, Vedant Misra, Kevin Robinson, Liam Fe-
+dus, Denny Zhou, Daphne Ippolito, David Luan,
+Hyeontaek Lim, Barret Zoph, Alexander Spiridonov,
+Ryan Sepassi, David Dohan, Shivani Agrawal, Mark
+Omernick, Andrew M. Dai, Thanumalayan Sankara-
+narayana Pillai, Marie Pellat, Aitor Lewkowycz,
+Erica Moreira, Rewon Child, Oleksandr Polozov,
+Katherine Lee, Zongwei Zhou, Xuezhi Wang, Bren-
+nan Saeta, Mark Díaz, Orhan Firat, Michele Catasta,
+Jason Wei, Kathleen S. Meier-Hellstern, Douglas
+Eck, Jeff Dean, Slav Petrov, and Noah Fiedel. 2022.
+Palm: Scaling language modeling with pathways.
+ArXiv , abs/2204.02311.
+Nick Craswell, Bhaskar Mitra, Emine Yilmaz, Daniel
+Campos, and Ellen M V oorhees. 2020a. Overview
+of the trec 2019 deep learning track. ArXiv preprint ,
+abs/2003.07820.
+Nick Craswell, Bhaskar Mitra, Emine Yilmaz,
+Daniel Fernando Campos, and Ellen M. V oorhees.
+2020b. Overview of the trec 2020 deep learning
+track. ArXiv , abs/2003.07820.
+Thibault Formal, Benjamin Piwowarski, and Stéphane
+Clinchant. 2021. Splade: Sparse lexical and expan-
+sion model for ﬁrst stage ranking. Proceedings of
+the 44th International ACM SIGIR Conference on
+Research and Development in Information Retrieval .
+Luyu Gao and Jamie Callan. 2021. Condenser: a pre-
+training architecture for dense retrieval. In Proceed-
+ings of the 2021 Conference on Empirical Methods
+in Natural Language Processing , pages 981–993,
+Online and Punta Cana, Dominican Republic. Asso-
+ciation for Computational Linguistics.
+Luyu Gao, Xueguang Ma, Jimmy Lin, and Jamie
+Callan. 2022. Precise zero-shot dense retrieval with-
+out relevance labels. ArXiv , abs/2212.10496.
+Faegheh Hasibi, Fedor Nikolaev, Chenyan Xiong,
+Krisztian Balog, Svein Erik Bratsberg, Alexander
+Kotov, and Jamie Callan. 2017. Dbpedia-entity v2:
+A test collection for entity search. In Proceedings
+of the 40th International ACM SIGIR Conference on
+Research and Development in Information Retrieval,
+Shinjuku, Tokyo, Japan, August 7-11, 2017 , pages
+1265–1268. ACM.Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick
+Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and
+Wen-tau Yih. 2020. Dense passage retrieval for
+open-domain question answering. In Proceedings of
+the 2020 Conference on Empirical Methods in Nat-
+ural Language Processing (EMNLP) , pages 6769–
+6781, Online. Association for Computational Lin-
+guistics.
+Victor Lavrenko and W. Bruce Croft. 2001. Relevance-
+based language models. ACM SIGIR Forum , 51:260
+– 267.
+Jimmy J. Lin and Xueguang Ma. 2021. A few brief
+notes on deepimpact, coil, and a conceptual frame-
+work for information retrieval techniques. ArXiv ,
+abs/2106.14807.
+Jimmy J. Lin, Xueguang Ma, Sheng-Chieh Lin, Jheng-
+Hong Yang, Ronak Pradeep, Rodrigo Nogueira, and
+David R. Cheriton. 2021. Pyserini: A python toolkit
+for reproducible information retrieval research with
+sparse and dense representations. Proceedings of the
+44th International ACM SIGIR Conference on Re-
+search and Development in Information Retrieval .
+Yuanhua Lv and ChengXiang Zhai. 2009. A compara-
+tive study of methods for estimating query language
+models with pseudo feedback. Proceedings of the
+18th ACM conference on Information and knowl-
+edge management .
+George A. Miller. 1992. WordNet: A lexical database
+for English. In Speech and Natural Language: Pro-
+ceedings of a Workshop Held at Harriman, New
+York, February 23-26, 1992 .
+Rodrigo Nogueira and Jimmy Lin. From doc2query to
+doctttttquery.
+Rodrigo Nogueira, Wei Yang, Jimmy J. Lin, and
+Kyunghyun Cho. 2019. Document expansion by
+query prediction. ArXiv , abs/1904.08375.
+Yingqi Qu, Yuchen Ding, Jing Liu, Kai Liu, Ruiyang
+Ren, Wayne Xin Zhao, Daxiang Dong, Hua Wu,
+and Haifeng Wang. 2021. RocketQA: An opti-
+mized training approach to dense passage retrieval
+for open-domain question answering. In Proceed-
+ings of the 2021 Conference of the North Ameri-
+can Chapter of the Association for Computational
+Linguistics: Human Language Technologies , pages
+5835–5847, Online. Association for Computational
+Linguistics.
+Ruiyang Ren, Yingqi Qu, Jing Liu, Wayne Xin Zhao,
+QiaoQiao She, Hua Wu, Haifeng Wang, and Ji-Rong
+Wen. 2021. RocketQAv2: A joint training method
+for dense passage retrieval and passage re-ranking.
+InProceedings of the 2021 Conference on Empiri-
+cal Methods in Natural Language Processing , pages
+2825–2835, Online and Punta Cana, Dominican Re-
+public. Association for Computational Linguistics.
+J. J. Rocchio. 1971. Relevance feedback in information
+retrieval.Zhiqing Sun, Xuezhi Wang, Yi Tay, Yiming Yang, and
+Denny Zhou. 2022. Recitation-augmented language
+models. ArXiv , abs/2210.01296.
+Nandan Thakur, Nils Reimers, Andreas Rücklé, Ab-
+hishek Srivastava, and Iryna Gurevych. 2021. Beir:
+A heterogeneous benchmark for zero-shot evalua-
+tion of information retrieval models. In Thirty-ﬁfth
+Conference on Neural Information Processing Sys-
+tems Datasets and Benchmarks Track (Round 2) .
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+Baptiste Rozière, Naman Goyal, Eric Hambro,
+Faisal Azhar, Aur’elien Rodriguez, Armand Joulin,
+Edouard Grave, and Guillaume Lample. 2023.
+Llama: Open and efﬁcient foundation language mod-
+els.ArXiv , abs/2302.13971.
+Ellen V oorhees, Tasmeer Alam, Steven Bedrick, Dina
+Demner-Fushman, William R Hersh, Kyle Lo, Kirk
+Roberts, Ian Soboroff, and Lucy Lu Wang. 2021.
+Trec-covid: constructing a pandemic information re-
+trieval test collection. In ACM SIGIR Forum , vol-
+ume 54, pages 1–12. ACM New York, NY , USA.
+David Wadden, Shanchuan Lin, Kyle Lo, Lucy Lu
+Wang, Madeleine van Zuylen, Arman Cohan, and
+Hannaneh Hajishirzi. 2020. Fact or ﬁction: Verify-
+ing scientiﬁc claims. In Proceedings of the 2020
+Conference on Empirical Methods in Natural Lan-
+guage Processing (EMNLP) , pages 7534–7550, On-
+line. Association for Computational Linguistics.
+Liang Wang, Nan Yang, Xiaolong Huang, Binxing Jiao,
+Linjun Yang, Daxin Jiang, Rangan Majumder, and
+Furu Wei. 2022a. Simlm: Pre-training with rep-
+resentation bottleneck for dense passage retrieval.
+ArXiv , abs/2207.02578.
+Liang Wang, Nan Yang, Xiaolong Huang, Binx-
+ing Jiao, Linjun Yang, Daxin Jiang, Rangan Ma-
+jumder, and Furu Wei. 2022b. Text embeddings by
+weakly-supervised contrastive pre-training. ArXiv ,
+abs/2212.03533.
+Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang,
+Jialin Liu, Paul N. Bennett, Junaid Ahmed, and
+Arnold Overwijk. 2021. Approximate nearest neigh-
+bor negative contrastive learning for dense text re-
+trieval. In 9th International Conference on Learning
+Representations, ICLR 2021, Virtual Event, Austria,
+May 3-7, 2021 . OpenReview.net.
+W. Yu, Dan Iter, Shuohang Wang, Yichong Xu, Mingx-
+uan Ju, Soumya Sanyal, Chenguang Zhu, Michael
+Zeng, and Meng Jiang. 2022. Generate rather than
+retrieve: Large language models are strong context
+generators. ArXiv , abs/2209.10063.
+Hang Zhang, Yeyun Gong, Yelong Shen, Jiancheng
+Lv, Nan Duan, and Weizhu Chen. 2021. Adversar-
+ial retriever-ranker for dense text retrieval. ArXiv
+preprint , abs/2110.03611.query who sings hey good looking
+LLM generation Hey Good Lookin’ was originally written and recorded by the country music singer Hank
+Williams in1951 . The song has since been covered by several other artists and bands,
+including Jimmy Buffett, Conway Twitty, and Willie Nelson.
+Groundtruth Hey, Good Lookin’. (1951) Hey, Good Lookin’ is a 1951 song written and recorded byHank
+Williams , and his version was inducted into the Grammy Hall of Fame in 2001. Since its
+original 1951 recording it has been covered by a variety of artists .
+query trumbull marriott fax number
+LLM generation The fax number for the Trumbull Marriott Shelton is 203-378 -4444 .
+Groundtruth Business name: Trumbull Marriott Merritt Parkway; Address: 180 Hawley Lane Trumbull,
+Connecticut 06611; Phone number: 203-378-4958; Fax number: 203-378 -1400; Business
+hours: 24; Credit cards accepted: Yes; Number of employees: 10-19; Map:
+query what is hra and hsa
+LLM generation HRA stands for Health Reimbursement Arrangement. It is a type of beneﬁt plan where an
+employer reimburses employees for qualifying medical expenses . It also allows employers
+to set aside money tax-free to reimburse employees for medical expenses that are not covered
+under the employer’s health insurance plan. HSA stands for Health Savings Account. It is
+a savings account that is used in conjunction with a qualiﬁed High Deductible Health Plan
+(HDHP) . An HSA enables an individual to pay for current health expenses and save for future
+health expenses on a tax-free basis. Contributions to the account are tax
+Groundtruth The key difference between HRA and HSA is that HRA is an employer funded health beneﬁt
+plan that reimburses formedical expenses including personal health insurance policy pre-
+miums of employees whereas HSA is also a tax-advantaged health beneﬁt plan exclusively
+available to taxpayers in the United States who are enrolled in a High-Deductible Health Plan
+(HDHP) .
+Table 7: More examples of LLM generations. The format is the same as in Table 5.
+A Implementation Details
+For dense retrieval experiments in Table 1, we
+list the hyperparameters in Table 8. When
+training dense retrievers with distillation from
+cross-encoder, we use the same teacher score
+released by Wang et al.. The SimLM and
+E5 checkpoints for initialization are pub-
+licly available at https://huggingface.
+co/intfloat/simlm-base-msmarco and
+https://huggingface.co/intfloat/
+e5-base-unsupervised . To compute the
+text embeddings, we utilize the [CLS] vector for
+SimLM and mean pooling for E5. This makes sure
+that the pooling mechanisms remain consistent
+between intermediate pre-training and ﬁne-tuning.
+When prompting LLMs, we include 4 in-context
+examples from the MS-MARCO training set. To
+increase prompt diversity, we randomly select 4
+examples for each API call. A complete prompt is
+shown in Table 9.
+Regarding out-of-domain evaluations on DBpe-
+dia (Hasibi et al., 2017), NFCorpus (Boteva et al.,
+2016), Scifact (Wadden et al., 2020), Trec-Covid
+(V oorhees et al., 2021), and Touche2020 (Bon-
+darenko et al., 2022), SimLM’s results are based
+on the released checkpoint by Wang et al..DPR w/ distillation
+learning rate 210 5310 5
+PLM BERT base SimLM / E5 base-unsup
+# of GPUs 4 4
+warmup steps 1000 1000
+batch size 64 64
+epoch 3 6
+ n.a. 0.2
+negatives depth 1000 200
+query length 144 144
+passage length 144 144
+# of negatives 15 23
+Table 8: Hyper-parameters for training dense retrievers
+on MS-MARCO passage ranking dataset.
+For ablation experiments in Figure 2, we ﬁne-
+tune for 40 epochs or 18k steps, whichever is
+reached ﬁrst.promptsWrite a passage that answers the given query:
+Query: what state is this zip code 85282
+Passage: Welcome to TEMPE, AZ 85282. 85282 is a rural zip code in Tempe, Arizona. The population
+is primarily white, and mostly single. At $200,200 the average home value here is a bit higher than
+average for the Phoenix-Mesa-Scottsdale metro area, so this probably isn’t the place to look for housing
+bargains.5282 Zip code is located in the Mountain time zone at 33 degrees latitude (Fun Fact: this is the
+same latitude as Damascus, Syria!) and -112 degrees longitude.
+Query: why is gibbs model of reﬂection good
+Passage: In this reﬂection, I am going to use Gibbs (1988) Reﬂective Cycle. This model is a recognised
+framework for my reﬂection. Gibbs (1988) consists of six stages to complete one cycle which is able
+to improve my nursing practice continuously and learning from the experience for better practice in the
+future.n conclusion of my reﬂective assignment, I mention the model that I chose, Gibbs (1988) Reﬂective
+Cycle as my framework of my reﬂective. I state the reasons why I am choosing the model as well as some
+discussion on the important of doing reﬂection in nursing practice.
+Query: what does a thousand pardons means
+Passage: Oh, that’s all right, that’s all right, give us a rest; never mind about the direction, hang the
+direction - I beg pardon, I beg a thousand pardons, I am not well to-day; pay no attention when I soliloquize,
+it is an old habit, an old, bad habit, and hard to get rid of when one’s digestion is all disordered with eating
+food that was raised forever and ever before he was born; good land! a man can’t keep his functions
+regular on spring chickens thirteen hundred years old.
+Query: what is a macro warning
+Passage: Macro virus warning appears when no macros exist in the ﬁle in Word. When you open
+a Microsoft Word 2002 document or template, you may receive the following macro virus warning,
+even though the document or template does not contain macros: C:\<path>\<ﬁle name>contains macros.
+Macros may contain viruses.
+Query: when was pokemon green released
+Passage:
+outputPokemon Green was released in Japan on February 27th, 1996. It was the ﬁrst in the Pokemon series of
+games and served as the basis for Pokemon Red and Blue, which were released in the US in 1998. The
+original Pokemon Green remains a beloved classic among fans of the series.
+Table 9: The full prompt used for the example in Figure 1."
