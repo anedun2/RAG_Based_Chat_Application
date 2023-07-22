@@ -26,7 +26,8 @@ The below flowchart represents how a RAG Model works.
 ## Indexing
 The Index is a data structure that allows fast retrieval of relevant context for a user query. For LlamaIndex, it is the core foundation for retrieval-augmented generation (RAG) use cases. 
 
-After loading the data, the text or the unstructured data is embedded, and the resulting embedding vectors are stored in Vector Stores or Vector Databases. The below image gives a basic visual representation of how a part of the text is represented as embedding vectors. 
+After loading the data, the text or the unstructured data is embedded, and the resulting embedding vectors are stored in Vector Stores or Vector Databases. The below image gives a basic visual representation of how a part of the text is represented as embedding vectors.
+
 <img width="441" alt="image" src="https://github.com/anedun2/RAG_Based_Chat_Application/assets/51900900/7801cbca-4e87-4d1a-b837-6ab3b3513465">
 
 By default, VectorStoreIndex uses an in-memory SimpleVectorStore that is initialized as part of the default storage context. We can also use a custom vector store like PineconeVectorStore, ChromaVectorStore, DeepLakeVectorStore, and other Vector Stores supported by LlamaIndex.
