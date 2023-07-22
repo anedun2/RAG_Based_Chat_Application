@@ -20,6 +20,7 @@ Chat application that allows users to have interactive conversations with the co
 Initially, the documents are ingested using a data connector (i.e., Reader) present in LlamaHub. These documents can be split into nodes if they are very big. For our example, we will be taking data points that are small, so we can directly proceed to indexing.
 
 The below flowchart represents how a RAG Model works.
+
 <img width="468" alt="image" src="https://github.com/anedun2/RAG_Based_Chat_Application/assets/51900900/2a0bad0c-7b9b-444d-bd11-f8d1bcf5e9bb">
 
 ## Indexing
