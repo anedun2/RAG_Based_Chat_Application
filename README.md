@@ -54,12 +54,14 @@ Here is an example of the first few dimensions given by the model for "show me i
 [0.20641953, 0.35582256, 0.6058123, -0.058944624, 0.8949609, 1.2956009, 1.2408538, -0.89241934, -0.56218493, -0.5521631, -0.11521566, 0.9081634, 1.662983, -0.9293592, -2.3170912, 1.177852, 0.35577637, ... ]
 
 To get some visual intuition about this, these numbers are plotted on a heatmap after reducing their dimensionality to 10. The heatmap below shows 10-dimensional embeddings of 9 data points.
+
 <img width="468" alt="image" src="https://github.com/anedun2/RAG_Based_Chat_Application/assets/51900900/2cecce4e-42a6-4162-9b71-742169b7681a">
 
 ## Querying
 Querying a vector store index involves fetching the top-k most similar Nodes and passing those into the Response Synthesis module. So, during query time the unstructured query is embedded and the ‘most similar’ embedding vectors are retrieved.
 
 So, if we provide an unstructured query that says, "show me inquiries about boston ground transportation", embedding vectors that are most similar to the query are fetched as seen in the heatmap below. They are all inquiries about ground transportation in Boston and their embeddings patterns are very similar.
+
 <img width="468" alt="image" src="https://github.com/anedun2/RAG_Based_Chat_Application/assets/51900900/808859d9-659b-45e3-980e-c1b50aa82f8b">
 
 So based on the query, the Retrievers fetch the most relevant context from an index based on the similarity between the embedding vectors.
@@ -91,6 +93,5 @@ These are the inquiries about Boston ground transportation:
 This class takes in a query and returns a Response object. It can make use of Retrievers and Response Synthesizer modules under the hood. Conceptually, it is a stateful analogy of Query Engine. The Query engine is a generic interface that allows the user to ask questions over the ingested data. A query engine takes in a natural language query and returns a rich response.
 
 A Chat Engine keeps track of the conversation history, it can answer questions with past context in mind.
-![image](https://github.com/anedun2/RAG_Based_Chat_Application/assets/51900900/5a054386-2dbe-4ba0-8ffd-a89fe8a0ff35)
 
 
