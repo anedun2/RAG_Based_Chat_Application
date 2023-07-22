@@ -78,9 +78,9 @@ LlamaIndex offers different methods of synthesizing a response from a relevant c
 
 So, based on the above query, it fetches the most similar nodes shown in the heatmap:
 
-show me a list of ground transportation at boston airport 
+"show me a list of ground transportation at boston airport 
 show me boston ground transportation
-what ground transportation is available in boston
+what ground transportation is available in boston"
 
 Now, the Response Synthesizer reiterates and refines the answer based on the context and gives the following response:
 
