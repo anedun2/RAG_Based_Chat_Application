@@ -14,4 +14,4 @@ Chat application that allows users to have interactive conversations with the co
 ### **NOTE**: The OpenAI API key should be stored in config.py file 
 
 ## Output on a CLI:
-<img width="1440" alt="Screenshot 2023-07-21 at 5 31 56 PM" src="https://github.com/anedun2/RAG_Based_Chat_Application/assets/51900900/25317172-75b8-4b2e-9391-b705d7193b27">
+<img width="1439" alt="Screenshot 2023-07-22 at 11 27 31 AM" src="https://github.com/anedun2/RAG_Based_Chat_Application/assets/51900900/82a9a7dd-2a94-44c3-9f06-2fee5fc706d7">
